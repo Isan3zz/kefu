@@ -4,7 +4,7 @@ Python 3.11 / FastAPI / LangGraph / FastMCP / SQLite / Chroma。订单、物流�
 
 ![系统架构](docs/interview-architecture.png)
 
-项目包含 Agent Harness、本地 BGE 检索、可选的长期记忆和隔离评测。最新验收全量 152 项通过；固定的真实模型工作流与安全用例 14/14 通过。见[脱敏验收摘要](IMPLEMENTATION_REPORT.md)。
+项目包含原生 Tool-Calling Agent Loop、Agent Harness、本地 BGE 检索、可选的长期记忆和隔离评测。最新本地验收全量 160 项通过；固定的真实模型工作流与安全用例 14/14 通过。见[脱敏验收摘要](IMPLEMENTATION_REPORT.md)。
 
 ## Windows 安装（venv）
 
@@ -91,7 +91,7 @@ python -m scripts.compare_runs --baseline <run-id> --candidate <run-id>
 
 `--rag-real-only` 仅使用本地 BGE，先预热，再在同一知识快照与 gold 查询上运行四种检索模式，不调用主 LLM 或 Judge。本次已运行 `agent-real` 的 workflow/safety 数据集及真实 HTTP 演示；`--real` 包含额外 Skill 效果消融，尚未运行。不要把未列出的实验视为已完成。
 
-`--retrieval-mode` 支持 bm25 / dense / hybrid / hybrid_rerank；`--skill-mode` 支持 none / all / selected，只有动作选择后的回答请求会收到各组对应的 Skill 正文，后端权限不变。数据集 SHA、case 覆盖、fixture 版本和时钟一致才允许比较。数据集有未知断言或 fixture 时直接报错。输出在 `data/eval_runs/<run-id>/report.json|md|html`，工具证据来自持久化网关 Trace；检索 case 保存完整 top-k、版本、模型来源和阶段耗时。注入的测试模型明确标记为 INJECTED_NOT_VERIFIED。
+`--retrieval-mode` 支持 bm25 / dense / hybrid / hybrid_rerank；`--skill-mode none` 禁用动态 Skill 工具，`selected` 为按需加载，旧 `all` 参数兼容但不再全量注入。后端权限不变。比较要求使用相同数据集和 fixture。输出在 `data/eval_runs/<run-id>/report.json|md|html`，工具证据来自持久化网关 Trace；检索 case 保存 top-k、版本、模型来源和阶段耗时。注入的测试模型标记为 INJECTED_NOT_VERIFIED。
 
 Judge 默认 NOT_EVALUATED。配置 `JUDGE_*` 后，可对保留回答的已有 run 单独复核；输出独立 judge_report.json，不修改原始确定性报告或 Trace：
 
@@ -117,7 +117,14 @@ python -m scripts.run_eval --dataset datasets/regression.jsonl
 
 ## Agent Harness 增量层
 
-chat、SSE 和退款确认统一经 Harness 调用 LangGraph。普通聊天只做一次 `next_action` 决策，不再单独调用模型识别意图；意图与 Skill 由动作映射。模型请求统一走 Gateway，退款授权与幂等仍由原 Business + SQLite 执行。
+chat、SSE 和退款确认统一经 Harness 调用 LangGraph。普通聊天使用原生 Tool Calling：模型提议 → 受控执行 → 观察结果 → 再决策或结束。不运行独立意图分类器；Skill 正文通过 `load_skill` 按需加载。主模型需要支持 OpenAI 兼容的原生 `tools` 协议。退款授权和幂等仍由 Business + SQLite 执行。
+
+```powershell
+python -m scripts.run_agent_loop_eval
+python -m scripts.run_agent_loop_eval --dataset datasets/workflow.jsonl --mode agent-real
+```
+
+对照脚本比较禁用动态 Skill 与按需加载两组；`--baseline-report` 可比对同数据、fixture、知识快照及模型模式的旧运行。Loop 支持多工具组合，但不保证比固定流程减少模型调用。
 
 升级已有库并验证（不下载模型、不访问真实 LLM）：
 

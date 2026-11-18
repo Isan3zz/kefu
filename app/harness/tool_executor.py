@@ -38,20 +38,43 @@ class ToolExecutor:
     def __init__(self,gateway,guard,config,controller):
         self.gateway,self.guard,self.config,self.controller=gateway,guard,config,controller
         self.semaphore=asyncio.Semaphore(config.tool_max_concurrency)
-    async def invoke(self,*,ctx,skill_name,tool_name,arguments,budget,telemetry,source='agent'):
+    async def invoke(self,*,ctx,skill_name,tool_name,arguments,budget,telemetry,source='agent',proposal_id=None):
         # source is audit text, NEVER a capability.
-        return await self._invoke(ctx,skill_name,tool_name,arguments,budget,telemetry)
+        return await self._invoke(ctx,skill_name,tool_name,arguments,budget,telemetry,proposal_id=proposal_id)
+    async def invoke_internal(self, *, ctx, tool_name, arguments, budget, telemetry, handler, proposal_id):
+        start=time.perf_counter(); operation=uid('op-')
+        args=self.guard.check(ctx,budget,telemetry,None,tool_name,arguments,internal=True)
+        budget.tool_calls+=1; budget.tool_attempts+=1
+        telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=tool_name,risk_class='preview' if tool_name=='begin_refund_workflow' else 'read')
+        try:
+            if tool_name=='begin_refund_workflow':
+                data=await handler(args)
+            else:
+                async with asyncio.timeout(min(self.config.tool_timeout_seconds,ctx.remaining())):
+                    data=await handler(args)
+            outcome=dict(ok=True,data=data,outcome='SUCCESS')
+        except DomainError as error:
+            outcome=dict(ok=False,error={'code':error.code,'message':error.message},outcome='KNOWN_FAILURE')
+        except TimeoutError:
+            outcome=dict(ok=False,error={'code':'TOOL_TIMEOUT','message':'本地工具超时'},outcome='KNOWN_FAILURE')
+        return self.record_result(ToolExecutionResult(tool_name=tool_name,request_id=operation, attempts=1,
+                                  latency_ms=(time.perf_counter()-start)*1000,**outcome),args,operation)
     async def execute_refund_from_workflow(self,*,ctx,workflow_id,budget,telemetry):
         return await self._invoke(ctx,None,'submit_refund_request',{'workflow_id':workflow_id},budget,telemetry,self.guard)
     def record_result(self,result,args,operation):
         from app.observability import emit
-        emit('tool',layer='harness',name=result.tool_name,args=args,operation_id=operation,request_id=result.request_id,result=result.envelope(),ok=result.ok,status='success' if result.ok else 'error',error_code=result.error['code'] if result.error else None,attempts=result.attempts,outcome=result.outcome,duration_ms=result.latency_ms)
+        observed=result.envelope()
+        if result.tool_name=='load_skill' and result.ok:
+            observed['data']={key:value for key,value in result.data.items() if key!='guidance'}
+        emit('tool',layer='harness',name=result.tool_name,args=args,operation_id=operation,request_id=result.request_id,result=observed,ok=result.ok,status='success' if result.ok else 'error',error_code=result.error['code'] if result.error else None,attempts=result.attempts,outcome=result.outcome,duration_ms=result.latency_ms)
         return result
-    async def _invoke(self,ctx,skill_name,name,args,budget,telemetry,capability=None):
+    async def _invoke(self,ctx,skill_name,name,args,budget,telemetry,capability=None,proposal_id=None):
         start=time.perf_counter(); operation=uid('op-'); attempt=0
         args=self.guard.check(ctx,budget,telemetry,skill_name,name,args,workflow_capability=capability)
         budget.tool_calls+=1
         write=name not in READ_TOOLS
+        if proposal_id is not None:
+            telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=name,risk_class='write' if write else 'read')
         telemetry.emit('tool.started',tool_name=name,operation_id=operation)
         while True:
             ctx.remaining(); attempt+=1; budget.tool_attempts+=1
@@ -62,7 +85,7 @@ class ToolExecutor:
                         async with self.semaphore:
                             actual_timeout=min(self.config.tool_timeout_seconds,ctx.remaining())
                             async with asyncio.timeout(actual_timeout):
-                                raw=await self.gateway.call(ctx.principal,name,args,skill_name,capability is self.guard,single_attempt=True,timeout=actual_timeout,operation_id=operation,attempt_no=attempt)
+                                raw=await self.gateway.call(ctx.principal,name,args,skill_name,capability is self.guard,single_attempt=True,timeout=actual_timeout,operation_id=operation,attempt_no=attempt,**({'ticket_operation':ctx.invocation_id} if name=='create_ticket' else {}))
                                 result=ToolResponse.model_validate(raw,strict=True).model_dump(mode='json')
                                 if result['ok']: validate_payload(name,result['data'],ctx,args)
                                 return result

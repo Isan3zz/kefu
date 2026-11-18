@@ -137,6 +137,9 @@ def assertions(case,trace,final):
         ok=all(any(e['name']==wanted['name'] and all(e.get('args',{}).get(k)==v for k,v in wanted['args'].items()) for e in trace.get('tool_events',[])) for wanted in expected['tool_arguments'])
         check('tool_arguments',ok,True,'TOOL_ARGUMENT_ERROR')
     if 'submit_tool_count_max' in expected: check('submit_tool_count_max',tools.count('submit_refund_request')<=expected['submit_tool_count_max'],True,'IDEMPOTENCY_VIOLATION')
+    if 'terminal_reason' in expected: check('terminal_reason',final.get('terminal_reason'),expected['terminal_reason'],'LOOP_TERMINATION_ERROR')
+    if 'max_iterations' in expected: check('max_iterations',final.get('iterations',0)<=expected['max_iterations'],True,'LOOP_BUDGET_ERROR')
+    if 'activated_skills' in expected: check('activated_skills',sorted(final.get('activated_skills',[])),sorted(expected['activated_skills']),'SKILL_ACTIVATION_ERROR')
     if final.get('illegal_attempt'):
         check('illegal_attempt',True,False,'WORKFLOW_VIOLATION')
     for invariant,category in [('unauthorized_action_count','AUTHORIZATION_VIOLATION'),('duplicate_refund_count','IDEMPOTENCY_VIOLATION')]:
@@ -183,7 +186,8 @@ def release(config):
     for path in sorted((ROOT/'app').rglob('*.py')):
         source.update(str(path.relative_to(ROOT)).encode()); source.update(path.read_bytes())
     lock=ROOT/'uv.lock'
-    return dict(git_commit=commit,source_sha256=source.hexdigest(),uv_lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,llm=config.llm_model,temperature=0,prompt='next-action-v1',prompts={'next_action':'next-action-v1','answer':'grounded-answer-v2'},skills={n:sm.load(n)['hash'] for n in sm.catalog},tool_schema=TOOL_SCHEMA_VERSION,models=model_manifest(),policy='P-REFUND-v1',evaluator='v1',chunker=CHUNKER_VERSION)
+    from app.agent_loop import PROMPT_VERSION
+    return dict(git_commit=commit,source_sha256=source.hexdigest(),uv_lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,llm=config.llm_model,temperature=0,prompt=PROMPT_VERSION,prompts={'loop':PROMPT_VERSION},skills={n:sm.load(n)['hash'] for n in sm.catalog},tool_schema=TOOL_SCHEMA_VERSION,models=model_manifest(),policy='P-REFUND-v1',evaluator='v2',chunker=CHUNKER_VERSION)
 
 async def run(dataset,mode='deterministic',agent_release='local',config=settings,retrieval_mode='hybrid_rerank',skill_mode='selected',inject_unsafe_action=False):
     raw,cases=load_dataset(dataset)
@@ -288,6 +292,9 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             final['illegal_attempt']=any(e['name']=='submit_refund_request' and e.get('status')=='blocked' for e in all_tools) or any(e['type']=='policy.denied' for t in trace_payloads for e in t['events'])
             final['eligibility_reason']=next((e.get('result',{}).get('data',{}).get('reason_code') for e in reversed(all_tools) if e['name']=='check_refund_eligibility' and e.get('ok')),None)
             final['shipping_order_id']=next((e.get('args',{}).get('order_id') for e in reversed(all_tools) if e['name']=='track_shipment'),None)
+            final['terminal_reason']=response.get('terminal_reason')
+            final['iterations']=response.get('iteration_count',0)
+            final['activated_skills']=sorted({event['name'] for trace in trace_payloads for event in trace['events'] if event['type']=='loop.skill_activated'})
             final.update(citation_counts)
             # A rejected foreign payload still demonstrates an upstream authorization defect.
             read_violations=audit_tool_reads(transport_evidence,a,owned_order_ids)
@@ -341,6 +348,8 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
     report['skill_load_estimated_tokens']=sum(e.get('estimated_tokens',0) for c in report['cases'] for t in c['traces'] for e in t['events'] if e['type']=='skill_load')
     from app.harness.metrics import harness_metrics
     report['harness']=harness_metrics(report)
+    from app.harness.loop_metrics import loop_metrics
+    report['loop']=loop_metrics(report['cases'])
     output=Path('data/eval_runs')/report['run_id']; output.mkdir(parents=True)
     persist_run_evidence(output,report)
     report['artifacts']={'trace_jsonl':str(output/'traces.jsonl'),'trace_index':str(output/'index.sqlite')}
@@ -351,6 +360,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
     md+='\n\nFailures:\n'+'\n'.join(c['case_id']+': '+str([r for r in c['results'] if r['passed'] is False]) for c in report['cases'] if c['passed'] is False)
     md+='\n\nUnknown outcomes (await reconciliation, not failed refunds):\n'+'\n'.join(c['case_id'] for c in report['cases'] if c['passed'] is None)
     md+='\n\nHarness metrics:\n'+json.dumps(report['harness'],ensure_ascii=False,indent=2)
+    md+='\n\nAgent Loop metrics:\n'+json.dumps(report['loop'],ensure_ascii=False,indent=2)
     (output/'report.md').write_text(md,encoding='utf-8'); (output/'report.html').write_text('<meta charset="utf-8"><pre>'+html.escape(md)+'</pre>',encoding='utf-8')
     return report
 

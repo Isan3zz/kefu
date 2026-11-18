@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
   <title id="title">智能客服 Agent · 系统架构</title>
-  <desc id="desc">单机双进程架构。FastAPI 请求经 Harness 进入 LangGraph，调用一次模型选择受控动作；动作进入知识检索、商品推荐偏好或业务工具。退款必须经用户确认和后端幂等提交。统一 Trace 支持隔离评测和回归。</desc>
+  <desc id="desc">单机双进程架构。FastAPI 请求经 Harness 进入有界 LangGraph Tool-Calling Agent Loop。模型提议工具，后端执行后返回观察；退款必须经用户确认和幂等提交。统一 Trace 支持隔离评测和回归。</desc>
   <defs>
     <style>
       text { font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17283c; }
@@ -31,7 +31,7 @@
   <rect width="1600" height="6" fill="#173857"/>
   <text x="64" y="57" class="eyebrow">SYSTEM ARCHITECTURE</text>
   <text x="62" y="112" class="title">智能客服 Agent · 系统架构</text>
-  <text x="64" y="154" class="subtitle">一次模型决策，后端校验执行，全链路可回归验证</text>
+  <text x="64" y="154" class="subtitle">模型提议工具，后端校验执行，观察结果后继续或收尾</text>
   <rect x="1219" y="55" width="317" height="65" rx="11" fill="#e8eff6"/>
   <text x="1241" y="82" class="label">单机双进程</text>
   <text x="1241" y="105" class="caption mono">FastAPI + FastMCP (loopback)</text>
@@ -53,13 +53,15 @@
 
   <rect x="696" y="221" width="376" height="115" rx="11" fill="#173857"/>
   <text x="717" y="249" class="label faint-white">单 Agent · LangGraph 决策节点</text>
-  <text x="717" y="281" class="component mono white">next_action</text>
+  <text x="717" y="281" class="component mono white">agent_decide</text>
   <text x="717" y="308" class="copy white">Model Gateway → OpenAI 兼容模型</text>
 
   <rect x="1104" y="221" width="432" height="115" rx="11" fill="#fff" stroke="#c4d4e3"/>
   <text x="1125" y="249" class="label">确定性执行节点</text>
-  <text x="1125" y="281" class="component mono">execute_action</text>
-  <text x="1125" y="308" class="copy">解析订单指代 · 匹配 Skill · 按动作调用</text>
+  <text x="1125" y="281" class="component mono">execute_tools</text>
+  <text x="1125" y="308" class="copy">参数校验 · 顺序执行 · 按需加载 Skill</text>
+  <path d="M1104 321H1076" class="flow"/>
+  <text x="1071" y="357" class="caption" text-anchor="end">ToolMessage：关联调用 ID，供下一轮决策</text>
 
   <path d="M1296 337V373H304" class="branch"/>
   <path d="M304 373V407" class="flow"/>
@@ -109,6 +111,6 @@
   <text x="404" y="805" class="copy white">记录动作、工具、引用与业务终态</text>
   <text x="404" y="832" class="caption faint-white">隔离数据复跑 · 安全断言 · 版本对比</text>
   <line x1="1023" y1="792" x2="1023" y2="832" stroke="#64819b"/>
-  <text x="1047" y="805" class="copy white" style="font-weight:700">34 → 17 次模型请求</text>
-  <text x="1047" y="832" class="caption faint-white">固定的工作流 + 安全用例（真实模型，14/14 通过）</text>
+  <text x="1047" y="805" class="copy white" style="font-weight:700">有界循环与明确终止</text>
+  <text x="1047" y="832" class="caption faint-white">默认 8 次决策 / 12 次工具执行；待确认立即停轮</text>
 </svg>

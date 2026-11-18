@@ -114,6 +114,9 @@ class HarnessFacade:
                 failure.invocation_id=ctx.invocation_id; failure.trace_id=ctx.trace_id
                 raise failure from None
             finally:
+                if any(event['type']=='loop.started' for event in recorder.payload['events']) and not any(event['type']=='loop.terminated' for event in recorder.payload['events']):
+                    outstanding={event['tool_call_id'] for event in recorder.payload['events'] if event['type']=='loop.tool_proposed'}-{event['tool_call_id'] for event in recorder.payload['events'] if event['type']=='loop.tool_observed'}
+                    telemetry.emit('loop.terminated',terminal_reason={'TIMED_OUT':'TIMEOUT','CANCELLED':'CANCELLED'}.get(status,'LIMIT' if code=='STEP_LIMIT_EXCEEDED' else 'ERROR'),iterations=budget.steps,tool_calls=budget.tool_calls,error_code=code,unobserved_tool_call_ids=sorted(outstanding))
                 telemetry.emit('invocation.finished',status=status,error_code=code,step_count=budget.steps,model_calls=budget.model_calls,tool_calls=budget.tool_calls,model_attempts=budget.model_attempts,tool_attempts=budget.tool_attempts,duration_ms=(time.perf_counter()-recorder.started)*1000)
                 safe=clean(result) if result is not None else {'error_code':code,'answer':'执行未完成，请查询原操作状态','invocation_id':ctx.invocation_id,'trace_id':ctx.trace_id,'invocation_status':status}
                 if safe.get('pending_confirmation'): safe['pending_confirmation']['confirmation_credential_available']=False

@@ -51,7 +51,7 @@ class TraceRecorder:
         self.payload = dict(trace_id=metadata.pop('trace_id',None) or uid("trace-"), conversation_id=conversation_id,
                             tenant_id=actor.tenant_id, user_id=actor.user_id,
                             agent_release_id=config.agent_release_id,
-                            prompt_version="next-action-v1", started_at=now(), events=[], errors=[], **metadata)
+                            prompt_version="agent-loop-v1", started_at=now(), events=[], errors=[], **metadata)
         context=evaluation_context.get()
         self.payload.update(run_id=context.get('run_id'),case_id=context.get('case_id'))
         from app.rag import model_manifest

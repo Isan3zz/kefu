@@ -35,6 +35,7 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
     @app.exception_handler(DomainError)
     async def domain_error(request,e):
         status={'UNAUTHORIZED':401,'FORBIDDEN':403,'POLICY_DENIED':403,'NOT_FOUND':404,'INVALID_ARGUMENT':422,'LLM_NOT_CONFIGURED':503,'CONFIG_ERROR':503,'KNOWLEDGE_NOT_READY':503,'UPSTREAM_UNAVAILABLE':503,'TOOL_UPSTREAM_ERROR':503,'MODEL_UPSTREAM_ERROR':503,'MODEL_RATE_LIMIT':503,'MODEL_BAD_OUTPUT':502,'TOOL_BAD_RESULT':502,'SYSTEM_ERROR':500,'INTERNAL_ERROR':500,'TIMEOUT':504,'RUN_TIMEOUT':504,'MODEL_TIMEOUT':504,'TOOL_TIMEOUT':504}.get(e.code,409)
+        if e.code=='MODEL_TOOL_CALLING_UNSUPPORTED': status=503
         detail={'code':e.code,'message':e.message}
         if getattr(e,'invocation_id',None): detail.update(invocation_id=e.invocation_id,trace_id=e.trace_id)
         return JSONResponse(status_code=status,content=dict(code=e.code,data=None,error=detail,request_id=uid('req-')))

@@ -43,8 +43,8 @@ def decode_tool_result(result):
     if not isinstance(value,dict): value=json.loads(result.content[0].text)
     return ToolResponse.model_validate(value).model_dump(mode='json')
 
-def sign_actor(a, secret, expires=None):
-    body=json.dumps(dict(user_id=a.user_id,tenant_id=a.tenant_id,exp=expires or time.time()+60,aud="mcp",nonce=uid()),sort_keys=True).encode()
+def sign_actor(a, secret, expires=None, *, ticket_operation=None):
+    body=json.dumps(dict(user_id=a.user_id,tenant_id=a.tenant_id,exp=expires or time.time()+60,aud="mcp",nonce=uid(),ticket_operation=ticket_operation),sort_keys=True).encode()
     payload=base64.urlsafe_b64encode(body).decode()
     signature=hmac.new(secret.encode(),payload.encode(),hashlib.sha256).hexdigest()
     return payload+"."+signature
@@ -60,7 +60,7 @@ def verify_actor(token,secret,business):
         with business.db.tx() as c:
             r=c.execute(users.select().where(users.c.id==d['user_id'],users.c.tenant_id==d['tenant_id'])).mappings().first()
             if not r: raise ValueError()
-            return Actor(r['id'],r['tenant_id'],r['role'])
+            return Actor(r['id'],r['tenant_id'],r['role'],d.get('ticket_operation'))
     except (ValueError,KeyError,TypeError): raise DomainError("FORBIDDEN","内部身份凭据无效") from None
 
 # Used only by explicit in-process test transport; production always reads HTTP headers.
@@ -114,11 +114,11 @@ ALLOW={
 class Gateway:
     def __init__(self,business,config=settings,server=None):
         self.business,self.config,self.server=business,config,server
-    async def call(self,a,name,args,skill=None,trusted_workflow=False,*,single_attempt=False,timeout=None,operation_id=None,attempt_no=None):
+    async def call(self,a,name,args,skill=None,trusted_workflow=False,*,single_attempt=False,timeout=None,operation_id=None,attempt_no=None,ticket_operation=None):
         start=time.perf_counter(); call_id=uid('gateway-')
         emit('tool_attempt',name=name,args=args,request_id=call_id,skill=skill,trusted_workflow=trusted_workflow,operation_id=operation_id,attempt_no=attempt_no)
         try:
-            if single_attempt: result=await self._call(a,name,args,skill,trusted_workflow,single_attempt=True,timeout=timeout)
+            if single_attempt: result=await self._call(a,name,args,skill,trusted_workflow,single_attempt=True,timeout=timeout,**({'ticket_operation':ticket_operation} if ticket_operation else {}))
             else: result=await self._call(a,name,args,skill,trusted_workflow)
         except Exception as error:
             code=error.code if isinstance(error,DomainError) else 'TOOL_EXECUTION_ERROR'
@@ -126,11 +126,11 @@ class Gateway:
             raise
         emit('tool',name=name,args=args,request_id=call_id,result=result,ok=result['ok'],status='success' if result['ok'] else 'error',error_code=result['error']['code'] if result.get('error') else None,duration_ms=(time.perf_counter()-start)*1000,transport='inprocess' if self.server else 'http',layer='transport',operation_id=operation_id,attempt_no=attempt_no)
         return result
-    async def _call(self,a,name,args,skill=None,trusted_workflow=False,*,single_attempt=False,timeout=None):
+    async def _call(self,a,name,args,skill=None,trusted_workflow=False,*,single_attempt=False,timeout=None,ticket_operation=None):
         if name=='submit_refund_request':
             if not trusted_workflow: raise DomainError('FORBIDDEN','写工具仅供确认工作流调用')
         elif name not in ALLOW.get(skill,set()): raise DomainError('FORBIDDEN','工具不在白名单')
-        token=sign_actor(a,self.config.mcp_service_secret)
+        token=sign_actor(a,self.config.mcp_service_secret,ticket_operation=ticket_operation)
         for attempt in range(1 if single_attempt else 3 if name in {'get_orders','get_order','track_shipment','search_products','check_refund_eligibility'} else 1):
             marker=test_credential.set(token)
             try:

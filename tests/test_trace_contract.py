@@ -21,7 +21,7 @@ async def test_missing_llm_config_is_audited_without_raw_input(env):
     assert all(key in record['events'][0] for key in ('event_id','span_id','parent_span_id','ts','duration_ms','status','error_code'))
 
 async def test_decision_exception_and_cancellation_are_persisted(env,monkeypatch):
-    import app.agent as module
+    import app.agent_loop as module
     def fail(text): raise RuntimeError('private provider failure')
     monkeypatch.setattr(module,'fake_next_action',fail)
     with pytest.raises(DomainError) as error:

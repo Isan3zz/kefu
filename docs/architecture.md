@@ -6,7 +6,20 @@ Agent Harness 增量层已接入：API → HarnessFacade/RunController → 原 L
 
 完整职责、生命周期与恢复限制见 [Harness 运行说明](harness_runtime.md)，旧模块复用清单见 [集成图](harness_integration_map.md)。原有工具/RAG/退款安全边界继续适用。
 
-聊天图为 `decide_next_action` → `execute_action`。一次结构化模型调用只选一个受控动作；API 和评测所用的意图标签由代码按动作映射，Skill 随后按需加载。订单号和序号由服务端解析，工具权限仍由 Policy Guard 和 Business 独立校验。查订单、物流和退款预览不再为回复额外调用模型；只有需要知识证据或筛选已召回偏好时才继续调用模型。`deterministic` 使用同一动作协议的离线规则，不实现任意工具循环。
+普通聊天运行原生 Tool-Calling Agent Loop；`deterministic` 仅替换模型响应，仍走同一 LangGraph、工具权限和状态机。API 和评测意图标签由已执行工具派生，不参与编排。Skill 只有元数据进入首轮模型，上下文需要正文时使用 `load_skill`；个性化推荐才在准备阶段检索记忆一次。
+
+```mermaid
+flowchart LR
+    API[FastAPI → Harness] --> Context[准备上下文]
+    Context --> Model[模型原生 Tool Calls]
+    Model -->|工具提议| Tool[Policy Guard → Tool Executor]
+    Tool -->|有界观察 ToolMessage| Model
+    Tool -->|待确认 / 拒绝 / 上限| Final[确定性终止与输出校验]
+    Model -->|最终答复| Final
+    Tool -->|退款预览| WF[独立退款线程等待确认]
+```
+
+工具按返回顺序执行，结果与 `tool_call_id` 一一对应。默认上限为 8 次模型决策与 12 次工具执行，重复动作及不安全提议停止；待确认后本批剩余调用只记录跳过。`conv:` checkpoint 增加独立原生消息通道，不清空既有订单引用或 `wf:` 状态。
 
 每个会话 thread 为 conv:<id>，退款 thread 为 wf:<id>。退款预览事务保存订单、金额、policy version、order version、nonce hash、稳定 operation key。等待节点 interrupt 不执行写入；confirm 先事务确认身份、有效期及预览，然后 Command(resume)；独立 commit 节点再次检查业务资格。退款记录与 workflow 终态在同一事务提交，唯一订单与幂等键防止并发重复退款。未知写入结果按原 operation key 查单，不创建新键重试。
 

@@ -8,7 +8,7 @@
 | `DB.tx()`、SQLite、Alembic | `0004` 新增授权、记忆、修订、pending、job、候选操作表；未改业务表。归档和入队同事务，入队失败通过 savepoint 隔离。 |
 | `RAG.model()` / `RAG.client()` | 同一个本地 BGE-M3 和 Chroma 客户端，独立 `customer_memories_v1` collection；显式传 1024 维向量，不启用 Chroma 默认 embedding。按需复用同一 BGE reranker。 |
 | Harness Model Gateway / Context Manager | 一批进行一次成功的结构化提取；重试有上限。召回只为推荐回复提供低信任数据，最多 5 条 / 600 估算 tokens；不进入意图、工具计划或退款确认。 |
-| LangGraph、Recorder、Evaluation | 只有取得实时目录结果的推荐动作才按需召回；无可用记忆就不调用模型筛选。`conv:`、`wf:` 线程约定不变。任务与聊天通过统一 Recorder 关联源 ID；原评测断言、版本比较、Trace JSONL 和 SQLite 索引继续复用。 |
+| LangGraph、Recorder、Evaluation | Agent Loop 在准备推荐上下文时最多召回一次，后续决策复用；使用前二次核验，实时商品仍走工具。`conv:`、`wf:` 线程约定不变。任务与聊天通过统一 Recorder 关联源 ID；原评测断言、版本比较、Trace JSONL 和 SQLite 索引继续复用。 |
 
 ```
 归档 USER 消息 → 本地规则 (NOOP / REJECT / CANDIDATE / URGENT)

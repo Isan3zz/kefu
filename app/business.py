@@ -15,6 +15,7 @@ class Actor:
     user_id: str
     tenant_id: str
     role: str = "customer"
+    ticket_operation: str | None = None
 
 class Business:
     policy = "P-REFUND-v1"
@@ -52,12 +53,22 @@ class Business:
             elif not timedelta(0)<=self.clock()-datetime.fromisoformat(o['delivered_at'])<=timedelta(days=7): reason="EXPIRED"
         elif o['status']!="PAID": reason="INVALID_STATUS"
         return dict(eligible=reason=="ELIGIBLE",reason_code=reason,amount_cents=o['paid_amount_cents'],policy_version=self.policy,requires_human=reason in ("HUMAN_REVIEW","MISSING_DELIVERY_TIME"))
-    def preview(self,a,conv,oid):
+    def preview(self,a,conv,oid,*,reuse_pending=False):
         with self.db.tx() as c:
             self.owned(c,conversations,a,conv)
             e=self.eligibility(c,a,oid)
             if not e['eligible']: raise DomainError("BUSINESS_RULE_FAILED",e['reason_code'])
             o=self.owned(c,orders,a,oid)
+            if reuse_pending:
+                prior=c.execute(select(workflow_instances).where(
+                    workflow_instances.c.tenant_id==a.tenant_id,workflow_instances.c.user_id==a.user_id,
+                    workflow_instances.c.conversation_id==conv,workflow_instances.c.order_id==oid,
+                    workflow_instances.c.status=='WAITING_CONFIRMATION',workflow_instances.c.order_version==o['version'],
+                    workflow_instances.c.amount_cents==e['amount_cents'],workflow_instances.c.policy_version==self.policy,
+                    workflow_instances.c.nonce_expires_at>self.clock().isoformat()).order_by(workflow_instances.c.updated_at.desc())).mappings().first()
+                if prior:
+                    return dict(workflow_id=prior['id'],order_id=oid,amount_cents=prior['amount_cents'],
+                                status=prior['status'],confirmation_credential_available=False)
             nonce=secrets.token_urlsafe(32); wid=uid("wf-")
             row=dict(id=wid,tenant_id=a.tenant_id,user_id=a.user_id,conversation_id=conv,graph_thread_id="wf:"+wid,type="refund",status="WAITING_CONFIRMATION",order_id=oid,amount_cents=e['amount_cents'],policy_version=self.policy,confirm_nonce_hash=digest(nonce),nonce_expires_at=(self.clock()+timedelta(minutes=15)).isoformat(),operation_key=wid+":refund",order_version=o['version'],version=1,updated_at=now())
             c.execute(workflow_instances.insert().values(**row))
@@ -122,7 +133,10 @@ class Business:
                 return [dict(r) for r in c.execute(select(products).where(products.c.tenant_id==a.tenant_id,products.c.name.contains(args.get('keyword',''))).limit(min(max(int(args.get('limit',10)),1),20))).mappings()]
             if name=="create_ticket":
                 self.owned(c,conversations,a,args['conversation_id'])
-                tid=uid('ticket-')
+                tid='ticket-'+digest(f"{a.tenant_id}:{a.user_id}:{args['conversation_id']}:{a.ticket_operation}")[:24] if a.ticket_operation else uid('ticket-')
+                if a.ticket_operation:
+                    old=c.execute(select(tickets.c.status).where(tickets.c.id==tid,tickets.c.tenant_id==a.tenant_id,tickets.c.user_id==a.user_id)).scalar()
+                    if old: return dict(ticket_id=tid,status=old)
                 c.execute(tickets.insert().values(id=tid,tenant_id=a.tenant_id,user_id=a.user_id,conversation_id=args['conversation_id'],summary=args['summary'][:2000],reason=args['category'][:100],status="OPEN",created_at=now()))
                 return dict(ticket_id=tid,status="OPEN")
             raise DomainError("INVALID_ARGUMENT")

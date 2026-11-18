@@ -15,7 +15,7 @@ async def test_H01_gateway_decides_once_and_answers_from_evidence(env):
     env['rag'].build('knowledge')
     result=await env['agent'].harness.invoke_chat(principal=env['a'],conversation_id=env['conv'],message='耳机有哪些颜色',mode='deterministic')
     assert result['citations']
-    assert [c['purpose'] for c in env['agent'].harness.fake_model.calls]==['next_action','final_answer']
+    assert [c['purpose'] for c in env['agent'].harness.fake_model.calls]==['agent_loop','agent_loop']
     assert {c['invocation_id'] for c in env['agent'].harness.fake_model.calls}=={result['invocation_id']}
     assert env['agent'].harness.controller.read(env['a'],result['invocation_id'])['model_calls']==2
 

@@ -5,10 +5,11 @@ from app.db import uid
 from pydantic import ValidationError
 from app.harness.contracts import HarnessFailure,ModelResult,ModelUsage
 from app.harness.recovery import backoff
+from app.harness.tool_protocol import decision_from_response
 
 def estimate_tokens(messages):
     # Conservative UTF-8 byte upper estimate; never advertised as provider token usage.
-    return 8+sum(8+len(str(m.get('content','')).encode('utf-8')) for m in messages)
+    return 8+sum(8+len((json.dumps(m, ensure_ascii=False) if 'tool_calls' in m else str(m.get('content',''))).encode('utf-8')) for m in messages)
 
 class ModelGateway:
     def __init__(self,config,client_factory=None):
@@ -24,7 +25,11 @@ class ModelGateway:
         return self.client
     async def close(self):
         if self.client: await self.client.close()
-    async def complete(self,*,ctx,messages,purpose,response_schema=None,temperature=None,budget,telemetry,model_id=None,**unused):
+    async def complete_with_tools(self, *, ctx, messages, tool_schemas, budget, telemetry, **unused):
+        return await self.complete(ctx=ctx, messages=messages, purpose='agent_loop', tool_schemas=tool_schemas,
+                                   budget=budget, telemetry=telemetry)
+
+    async def complete(self,*,ctx,messages,purpose,response_schema=None,temperature=None,budget,telemetry,model_id=None,tool_schemas=None,**unused):
         model_id=model_id or self.config.llm_model
         ctx.remaining(); budget.model_calls+=1
         start=time.perf_counter(); attempt=0; repairs=0; transient=0; timeouts=0; operation=uid('model-op-')
@@ -35,8 +40,9 @@ class ModelGateway:
         usages=[]
         while True:
             ctx.remaining()
-            estimate=estimate_tokens(request)+self.config.model_max_output_tokens
-            if estimate_tokens(request)>self.config.context_max_input_tokens:
+            input_estimate=estimate_tokens(request)+(len(json.dumps(tool_schemas).encode()) if tool_schemas else 0)
+            estimate=input_estimate+self.config.model_max_output_tokens
+            if input_estimate>self.config.context_max_input_tokens:
                 raise HarnessFailure('CONTEXT_BUDGET_EXCEEDED','模型 Schema 与必要上下文超出输入预算',source='model')
             if budget.token_estimate_spent+estimate>self.config.model_max_token_budget:
                 raise HarnessFailure('CONTEXT_BUDGET_EXCEEDED','本次模型调用预算不足',source='model')
@@ -46,6 +52,7 @@ class ModelGateway:
                 timeout=min(float(self.config.llm_timeout_seconds),ctx.remaining())
                 options={'model':model_id,'messages':request,'temperature':0 if temperature is None else temperature,'max_tokens':self.config.model_max_output_tokens}
                 if response_schema and self.config.model_json_mode: options['response_format']={'type':'json_object'}
+                if tool_schemas is not None: options.update(tools=tool_schemas, tool_choice='auto')
                 async with asyncio.timeout(timeout):
                     response=await client.with_options(max_retries=0,timeout=timeout).chat.completions.create(**options)
                 content=response.choices[0].message.content or ''
@@ -56,13 +63,14 @@ class ModelGateway:
                     budget.prompt_tokens+=usage.input_tokens; budget.completion_tokens+=usage.output_tokens
                 else: budget.provider_usage_complete=False
                 parsed=response_schema.model_validate_json(content).model_dump() if response_schema else None
-                if not response_schema and not content.strip(): raise ValueError('Empty model result')
+                if not response_schema and tool_schemas is None and not content.strip(): raise ValueError('Empty model result')
                 total_usage=ModelUsage(input_tokens=sum(u.input_tokens or 0 for u in usages),output_tokens=sum(u.output_tokens or 0 for u in usages),total_tokens=sum(u.total_tokens if u.total_tokens is not None else (u.input_tokens or 0)+(u.output_tokens or 0) for u in usages),source='provider') if len(usages)==attempt and all(u.source=='provider' for u in usages) else ModelUsage()
                 result=ModelResult(text=content,structured=parsed,model_id=model_id,usage=total_usage,attempts=attempt,latency_ms=(time.perf_counter()-start)*1000,finish_reason=response.choices[0].finish_reason)
+                decision=decision_from_response(response.choices[0].message,model_id,result.finish_reason) if tool_schemas is not None else result
                 telemetry.emit('model.completed',purpose=purpose,model_id=result.model_id,operation_id=operation,attempts=attempt,duration_ms=result.latency_ms,usage_source=result.usage.source,input_tokens=result.usage.input_tokens,output_tokens=result.usage.output_tokens)
                 from app.observability import emit
                 emit('llm',stage=purpose,model=result.model_id,duration_ms=result.latency_ms,attempts=attempt,usage={'prompt_tokens':result.usage.input_tokens,'completion_tokens':result.usage.output_tokens},usage_source=result.usage.source)
-                return result
+                return decision
             except asyncio.CancelledError: raise
             except Exception as exc:
                 if len(usages)<attempt: budget.provider_usage_complete=False
@@ -72,6 +80,8 @@ class ModelGateway:
                 else:
                     status=getattr(exc,'status_code',None)
                     code='CONFIG_ERROR' if status in (401,403) else 'MODEL_RATE_LIMIT' if status==429 else 'MODEL_UPSTREAM_ERROR'
+                    if tool_schemas is not None and status in (400,422) and 'tool' in str(exc).lower():
+                        code='MODEL_TOOL_CALLING_UNSUPPORTED'
                 if ctx.deadline_monotonic<=time.monotonic(): code='RUN_TIMEOUT'
                 telemetry.emit('model.failed',purpose=purpose,model_id=model_id,operation_id=operation,attempts=attempt,attempt_no=attempt,error_code=code,status='error',error_type=type(exc).__name__)
                 if code=='MODEL_BAD_OUTPUT' and repairs<1 and attempt<2+self.config.model_max_retries:
@@ -85,12 +95,15 @@ class ModelGateway:
                 from app.observability import emit
                 emit('llm',stage=purpose,model=model_id,duration_ms=(time.perf_counter()-start)*1000,attempts=attempt,usage={},usage_source='unavailable',error_code=code,status='error')
                 if isinstance(exc,HarnessFailure): raise
-                raise HarnessFailure(code,'模型返回暂不可用，请重试或转人工',source='model') from None
+                raise HarnessFailure(code,'当前模型或 API 不支持原生工具调用，请检查主模型配置' if code=='MODEL_TOOL_CALLING_UNSUPPORTED' else '模型返回暂不可用，请重试或转人工',source='model') from None
 
 class FakeModelGateway:
     """Explicit offline adapter with a deterministic action policy."""
     def __init__(self,config=None): self.calls=deque(maxlen=512); self.config=config
     async def close(self): pass
+    async def complete_with_tools(self, *, ctx, messages, tool_schemas, budget, telemetry, fake_message, **unused):
+        result = await self.complete(ctx=ctx, messages=messages, purpose='agent_loop', budget=budget, telemetry=telemetry)
+        return decision_from_response(fake_message(), result.model_id, 'stop')
     async def complete(self,*,ctx,messages,purpose,response_schema=None,budget,telemetry,task_state=None,**unused):
         ctx.remaining(); budget.model_calls+=1; budget.provider_usage_complete=False
         estimate=estimate_tokens(messages)+(self.config.model_max_output_tokens if self.config else 0)
@@ -101,10 +114,7 @@ class FakeModelGateway:
         self.calls.append({'invocation_id':ctx.invocation_id,'purpose':purpose})
         start=time.perf_counter(); state=task_state or {}; operation=uid('model-op-')
         telemetry.emit('model.started',purpose=purpose,model_id='FakeModelGateway',operation_id=operation)
-        if purpose=='next_action':
-            from app.agent import fake_next_action
-            value={'action':fake_next_action(state['message'])}
-        else: value=state.get('structured',{})
+        value=state.get('structured',{})
         parsed=response_schema.model_validate(value).model_dump() if response_schema else None
         text=json.dumps(parsed,ensure_ascii=False) if parsed is not None else state.get('offline_answer','显式离线演示，不代表真实模型回答。')
         result=ModelResult(text=text,structured=parsed,model_id='FakeModelGateway',attempts=1,latency_ms=(time.perf_counter()-start)*1000)

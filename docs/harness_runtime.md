@@ -38,7 +38,7 @@ API Auth 生成可信 Principal，Facade 校验归属并创建 frozen ExecutionC
 
 模型请求只有 app/harness/model_gateway.py 一处 SDK create 调用。动作决策、知识回答和可选 Judge 共用它；Agent.llm 仅为缓存客户端工厂。底层 SDK max_retries=0。默认 JSON 指令加严格 Pydantic 校验，不假定所有兼容 API 支持原生 JSON 模式；有明确支持时可设 MODEL_JSON_MODE=true。
 
-`next_action` 直接选择受控动作，不再另调用模型做意图分类。动作表同时定义 Schema 和对外意图映射；订单 ID、列表序号、Skill 和工具参数由代码确定。缺少所需订单时直接澄清，退款提交不在 Schema 内。Skill 正文只进入决策后的模型请求（如基于证据生成回答）；原确定性 Guard 和 Business 权限检查继续独立执行。
+`complete_with_tools` 使用原生 SDK 响应，保留工具 ID 并返回匹配的 `ToolMessage`。服务端解析订单指代、检查参数和主体；直接提交退款不在目录中。`load_skill`、RAG 和退款预览都使用受控内部适配器；Skill 内容不授予权限。HTTP 提供方明确拒绝工具协议时返回 `MODEL_TOOL_CALLING_UNSUPPORTED`，不以文本 JSON 代替工具调用。
 
 | 情况 | 策略 |
 |---|---|
@@ -53,7 +53,7 @@ API Auth 生成可信 Principal，Facade 校验归属并创建 frozen ExecutionC
 
 PolicyGuard 使用原 Skill Manager 可信白名单和严格工具参数 Schema。敏感退款只能经独立 execute_refund_from_workflow 能力路径；传 source='workflow' 无效。确认状态、订单/金额/版本及最终事务仍由原 Business 独立核验。成功工具数据也校验类型、订单/租户范围；退款必须能核对实际 DB 回执，不能仅相信工具自报成功。
 
-每次 `next_action` 决策计一步，模型/传输重试不增加 Agent step。动作执行使用原有请求 deadline 和工具预算；不会为结果已经充分的请求自动开始下一轮决策。
+每次 Loop 模型决策计一步，传输重试不增加该计数。工具顺序执行并单独计数；重复提议、严重错误、待确认和达到预算均停止。`loop.*` 记录提议、策略结果、观察和终止；取消或超时会记录尚未观察的调用 ID。
 
 每个组件使用 min(组件超时, remaining deadline)。读取消停止后续执行；开始写之前持久化 write_started 与原 workflow/operation 引用，再保留受控任务，断连不伪造业务取消、不换 key。进程消失时不宣称 shield 能保证执行：下次显式重试发现不属于当前进程的未终结请求，写请求标 UNKNOWN_OUTCOME，不重新派发；通过新的显式确认/状态查询核对原业务。不会启动时批量提交等待中的退款。
 
