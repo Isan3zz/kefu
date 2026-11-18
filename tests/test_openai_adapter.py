@@ -77,11 +77,50 @@ async def test_L03_multistep_knowledge_and_orders(env, loop_chat):
     def finish(body):
         observations = [json.loads(row['content']) for row in body['messages'] if row['role']=='tool']
         assert len(observations)==2 and observations[1]['data'][0]['id'].startswith('O')
-        return '售后政策见 ['+observations[0]['data'][0]['chunk_id']+']'
+        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
+        assert facts['B1']['label']=='本人订单列表' and facts['K1']['label']=='知识证据'
+        return '为您整理如下：{{K1}}；另外，{{B1}}。'
     result, requests, trace, _ = await loop_chat('售后政策是什么？顺便查下我的订单',[
         [call('search_knowledge',{'query':'耳机退款政策'})],[call('get_orders')],finish])
     assert len(requests)==3 and 'O1001' in result['answer'] and result['citations']
+    assert '另外，本次查到' in result['answer']
     assert [row['name'] for row in trace['events'] if row['type']=='loop.tool_observed']==['search_knowledge','get_orders']
+
+
+async def test_business_reply_uses_model_composition_without_another_call(loop_chat):
+    def compose(body):
+        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
+        assert [facts[key]['label'] for key in ('B1','B2')]==['订单详情','物流']
+        return '给您汇总一下：{{B2}}；同时，{{B1}}。'
+    result,requests,trace,_=await loop_chat('帮我总结 O1002 的订单和物流',[
+        [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O1002'})],compose])
+    assert len(requests)==2
+    assert result['answer']=='给您汇总一下：订单 O1002 的物流状态：运输中（模拟快递）；同时，订单 O1002 已发货，实付 299.00 元。'
+    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_TEMPLATE'
+
+
+@pytest.mark.parametrize(('draft','reason'),[
+    ('{{B1}}；退款已到账，{{B2}}。','UNVERIFIED_TEXT'),
+    ('{{B1}}；{{B9}}。','INVALID_FACT_REFERENCES'),
+    ('{{B1}}。','MISSING_FACT_REFERENCES'),
+    ('{{B1}}；{{B1}}；{{B2}}。','INVALID_FACT_REFERENCES'),
+])
+async def test_invalid_business_draft_falls_back_to_real_results(loop_chat,draft,reason):
+    result,_,trace,_=await loop_chat('查订单 O1002 和物流',[
+        [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O1002'})],draft])
+    assert '已发货' in result['answer'] and '运输中' in result['answer']
+    assert '到账' not in result['answer'] and '{{' not in result['answer']
+    event = next(row for row in trace['events'] if row['type']=='loop.reply_composed')
+    assert event['mode']=='VERIFIED_FALLBACK' and event['validation']==reason
+
+
+async def test_composed_partial_reply_does_not_claim_failed_shipment(loop_chat):
+    result,_,trace,_ = await loop_chat('查订单 O1002 和物流',[
+        [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O2001'})],
+        '为您汇总如下：{{B1}}。'])
+    assert '为您汇总如下：订单 O1002 已发货' in result['answer']
+    assert '查询结果未能确认' in result['answer'] and 'O2001' not in result['answer']
+    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_TEMPLATE'
 
 
 async def test_L05_L21_bad_json_observed_and_failure_not_fabricated(loop_chat):

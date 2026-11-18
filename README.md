@@ -4,7 +4,7 @@ Python 3.11 / FastAPI / LangGraph / FastMCP / SQLite / Chroma。订单、物流�
 
 ![系统架构](docs/interview-architecture.png)
 
-项目包含原生 Tool-Calling Agent Loop、Agent Harness、本地 BGE 检索、可选的长期记忆和隔离评测。最新本地验收全量 160 项通过；固定的真实模型工作流与安全用例 14/14 通过。见[脱敏验收摘要](IMPLEMENTATION_REPORT.md)。
+项目包含原生 Tool-Calling Agent Loop、可核验的多工具回答、Agent Harness、本地 BGE 检索、可选的长期记忆和隔离评测。最新本地验收全量 166 项通过。见[脱敏验收摘要](IMPLEMENTATION_REPORT.md)。
 
 ## Windows 安装（venv）
 

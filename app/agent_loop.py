@@ -20,8 +20,9 @@ from app.loop_tools import TOOL_SKILLS, VISIBLE_SCHEMAS, tool_catalog
 from app.memory.recommendations import budget_for
 from app.memory.trigger import CHANGE, STABLE, recommendation_request
 from app.observability import active_trace, clean
+from app.reply_composer import FACT_MARKER, REPLY_INSTRUCTION, ReplyFact, render_checked
 
-PROMPT_VERSION = 'agent-loop-v1'
+PROMPT_VERSION = 'agent-loop-v2'
 SYSTEM = ('你是中文客服。自主选择工具，收到可信结果后答复；无须工具时直接答复。'
           '同一条消息有多个需求时查齐再答，可一批提议多个只读调用。不要重复已得到结果的工具。'
           '先区分政策、资格检查、申请退款与查询退款进度。明确要求申请才用 begin_refund_workflow。'
@@ -88,12 +89,16 @@ class AgentLoop:
         self.telemetry.emit('run.step', iteration=self.budget.steps, tool_calls=self.budget.tool_calls)
         meta = [{key: entry[key] for key in ('name','description')} for entry in self.agent.skills.catalog.values() if entry['enabled']]
         previous = state['loop_messages']
+        facts = self.reply_facts()
+        task = {'message':self.text,'active_workflow_id':state.get('active_workflow_id'),
+                'resolved_order_id':self.resolve(state),'available_skills':meta if self.skill_mode != 'none' else []}
+        if facts:
+            task['reply_facts'] = {key:{'label':fact.label,'preview':fact.text[:100]} for key,fact in facts.items()}
         started = time.perf_counter()
         try:
             context = await self.services.context.build_context(
-                ctx=self.ctx, task_state={'message':self.text,'active_workflow_id':state.get('active_workflow_id'),
-                    'resolved_order_id':self.resolve(state),'available_skills':meta if self.skill_mode != 'none' else []},
-                recent_messages=state['messages'], system_prompt=SYSTEM, telemetry=self.telemetry,
+                ctx=self.ctx, task_state=task, recent_messages=state['messages'],
+                system_prompt=SYSTEM + (REPLY_INSTRUCTION if facts else ''), telemetry=self.telemetry,
                 memories=self.agent.memory.revalidate(self.ctx.principal, self.memories),
                 memory_embedding_version=self.agent.memory.index.version if self.memories else None,
                 protocol=protocol_messages(previous),
@@ -149,6 +154,11 @@ class AgentLoop:
         if name and name not in names:
             wire = SimpleNamespace(type='function', id=uid('call-'), function=SimpleNamespace(name=name, arguments=json.dumps(args,ensure_ascii=False)))
             return SimpleNamespace(tool_calls=[wire], content='')
+        facts = self.reply_facts()
+        if facts:
+            keys = [key for key in facts if key.startswith('B')] + [key for key in facts if key.startswith('K')][:1]
+            draft = ('为您整理如下：' if len(keys)>1 else '') + '；'.join('{{' + key + '}}' for key in keys) + '。'
+            return SimpleNamespace(tool_calls=[], content=draft)
         if self.citations:
             return SimpleNamespace(tool_calls=[], content=self.display_knowledge())
         return SimpleNamespace(tool_calls=[], content='您好，可以咨询商品、查询订单物流、申请退款或转人工。')
@@ -337,7 +347,32 @@ class AgentLoop:
     def display_knowledge(self):
         return '\n'.join(f"{row['content']} [{row['chunk_id']}] {row['document_title']} v{row['version']}" for row in self.citations.values())
 
-    def display_business(self, name, data):
+    def reply_facts(self):
+        facts = {}
+        labels = {'get_orders':'本人订单列表','get_order':'订单详情','track_shipment':'物流',
+                  'search_products':'实时商品','create_ticket':'人工工单','begin_refund_workflow':'退款资格',
+                  'check_refund_eligibility':'退款资格'}
+        for tool in self.tools:
+            name, result = tool['name'], tool['result']
+            if name not in labels or not result['ok'] or (name=='begin_refund_workflow' and self.pending):
+                continue
+            if name=='begin_refund_workflow' and any(prior['name']=='check_refund_eligibility' and prior['result']['ok']
+                    and prior['args']==tool['args'] and prior['result']['data']==result['data'] for prior in self.tools):
+                continue
+            facts[f'B{len(facts)+1}'] = ReplyFact(labels[name], self.display_business(name,result['data'],tool['args']))
+        if facts:
+            for number, row in enumerate(self.citations.values(), 1):
+                facts[f'K{number}'] = ReplyFact('知识证据',
+                    f"{row['content']} [{row['chunk_id']}] {row['document_title']} v{row['version']}")
+        return facts
+
+    def display_business(self, name, data, arguments):
+        statuses = {'PAID':'已支付', 'SHIPPED':'已发货', 'DELIVERED':'已送达', 'CANCELLED':'已取消'}
+        if name=='get_orders':
+            if not data:
+                return '未查询到您的订单'
+            orders = '、'.join(f"{order['id']}（{statuses.get(order['status'],order['status'])}）" for order in data)
+            return f'本次查到 {len(data)} 笔订单：{orders}'
         if name=='get_order' and '退款' in self.text:
             refund=data.get('refund_request')
             if not refund:
@@ -345,6 +380,16 @@ class AgentLoop:
             if refund['status']=='ACCEPTED':
                 return '退款申请已受理，申请编号：'+refund['refund_request_id']+'。受理不代表退款已到账。'
             return '退款申请状态：'+refund['status']
+        if name=='get_order':
+            cents = data['paid_amount_cents']
+            return f"订单 {data['id']} {statuses.get(data['status'],data['status'])}，实付 {cents//100}.{cents%100:02d} 元"
+        if name=='track_shipment':
+            order_id = arguments['order_id']
+            if not data:
+                return f'订单 {order_id} 暂无可核验的物流记录'
+            entries = '；'.join(row['status'] + (f"（{row['carrier']}）" if row.get('carrier') else '') +
+                               (f"，运单号 {row['tracking_no']}" if row.get('tracking_no') and '单号' in self.text else '') for row in data)
+            return f'订单 {order_id} 的物流状态：{entries}'
         if name=='create_ticket':
             return '已创建人工工单：'+data['ticket_id']
         if name in ('begin_refund_workflow','check_refund_eligibility'):
@@ -354,11 +399,32 @@ class AgentLoop:
             ceiling = budget_for(self.text,selected) if self.recommendation else None
             if ceiling is not None:
                 data=[item for item in data if item['stock']>0 and item['price_cents']<=ceiling]
-            answer=('预算内的实时商品信息：' if ceiling is not None else '实时商品信息：')+json.dumps(clean(data),ensure_ascii=False) if data else '当前目录中没有找到预算内的在售商品。' if ceiling is not None else '没有找到可用商品。'
+            if data:
+                products = '；'.join(self.display_product(item) for item in data)
+                answer = ('预算内的实时商品信息：' if ceiling is not None else '实时商品信息：') + products
+            else:
+                answer = '当前目录中没有找到预算内的在售商品。' if ceiling is not None else '没有找到可用商品。'
             if self.recommendation and selected and data:
                 answer += '\n推荐时参考了你已保存的偏好：'+'；'.join(item.content for item in selected)+'。商品以核实后的参数为准。'
             return answer
-        return json.dumps(clean(data),ensure_ascii=False)
+        raise ValueError('No renderer for business tool')
+
+    @staticmethod
+    def display_product(item):
+        cents = item['price_cents']
+        summary = f"{item['name']}：{cents//100}.{cents%100:02d} 元，库存 {item['stock']} 件"
+        try:
+            attrs = json.loads(item.get('attributes_json') or '{}')
+        except (TypeError, ValueError):
+            return summary
+        if isinstance(attrs, dict):
+            colors = attrs.get('colors')
+            if isinstance(colors, list) and colors and all(isinstance(color, str) for color in colors):
+                summary += '，颜色：' + '、'.join(colors)
+            warranty = attrs.get('warranty_months')
+            if type(warranty) is int and warranty > 0:
+                summary += f'，保修 {warranty} 个月'
+        return summary
 
     async def finish(self, state):
         history=state['loop_messages']; reason=state['terminal_reason']
@@ -369,13 +435,27 @@ class AgentLoop:
                 answer='已有待确认申请，请使用原确认按钮；如凭据丢失，请取消后重新申请。'
         else:
             draft=history[-1].content if history and not isinstance(history[-1],ToolMessage) else ''
-            parts=[self.display_business(tool['name'],tool['result']['data']) for tool in self.tools
-                   if tool['result']['ok'] and tool['name'] in BUSINESS_TOOLS | {'begin_refund_workflow'}]
+            facts=self.reply_facts()
+            parts=[]
+            if facts:
+                rendered, validation = render_checked(draft, facts)
+                if rendered:
+                    parts.append(rendered)
+                else:
+                    parts.extend(fact.text.rstrip('。')+'。' for key,fact in facts.items() if key.startswith('B'))
+                    if self.citations:
+                        parts.insert(0,self.display_knowledge())
+                self.emit('reply_composed',mode='MODEL_TEMPLATE' if rendered else 'VERIFIED_FALLBACK',
+                          validation=validation,fact_count=len(facts))
+                latest = {message.name:message.status for message in history if isinstance(message,ToolMessage)}
+                if reason!='LIMIT' and any(status=='error' for name,status in latest.items() if name!='load_skill'):
+                    parts.append('另有查询结果未能确认，请核对信息后重试。')
             ids=set(CITATION.findall(draft))
-            if self.citations:
+            if self.citations and not facts:
                 versions_ok=all(ident in self.citations and str(self.citations[ident]['version'])==version.rstrip('.')
                                 for ident,version in VERSIONED_CITATION.findall(draft))
-                parts.insert(0,draft if ids and ids<=self.citations.keys() and versions_ok and not CLAIM.search(draft) else self.display_knowledge())
+                parts.insert(0,draft if ids and ids<=self.citations.keys() and versions_ok and not CLAIM.search(draft)
+                             and not FACT_MARKER.search(draft) else self.display_knowledge())
             if reason=='LIMIT':
                 parts.append('已停止重复或超限的查询；如需继续，请缩小问题范围。')
             if not parts:
@@ -384,7 +464,7 @@ class AgentLoop:
                     if reason=='COMPLETED': reason='NEEDS_INPUT' if self.error=='INVALID_ARGUMENT' else 'ERROR'
                 elif any(tool['name']=='search_knowledge' for tool in self.tools):
                     parts.append('没有足够的有效资料，请补充问题或转人工。')
-                elif not draft or ids or ORDER_IDS.search(draft) or CLAIM.search(draft):
+                elif not draft or ids or FACT_MARKER.search(draft) or ORDER_IDS.search(draft) or CLAIM.search(draft):
                     parts.append('未获得可核验的信息，请补充具体问题或订单号。')
                     reason='NEEDS_INPUT'
                 elif re.search(r'请.{0,6}(?:提供|补充)|请问|哪一单',draft):
