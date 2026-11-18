@@ -1,0 +1,25 @@
+[project]
+name = "kefu-agent"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+ "fastapi", "uvicorn", "pydantic-settings", "sqlalchemy", "alembic",
+ "aiosqlite", "langgraph", "langgraph-checkpoint-sqlite", "fastmcp<3",
+ "chromadb", "sentence-transformers", "huggingface-hub", "rank-bm25",
+ "jieba", "numpy", "pyyaml", "httpx", "openai", "tenacity", "sentencepiece",
+]
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "pytest-cov"]
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools.packages.find]
+include = ["app*", "scripts*"]
+namespaces = false
+[tool.setuptools.package-data]
+app = ["catalog/*/SKILL.md"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+markers = ["models: requires explicitly downloaded local weights", "real: requires configured LLM"]
