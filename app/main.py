@@ -13,7 +13,7 @@ from app.config import settings,ROOT
 from app.db import *
 from app.business import Business,DomainError
 from app.mcp import Gateway
-from app.agent import Agent,clean
+from app.agent import Agent
 from app.memory.api import memory_router
 
 def create_app(config=settings,db=None,gateway=None,rag=None):

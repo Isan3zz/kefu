@@ -30,7 +30,7 @@ API Auth 生成可信 Principal，Facade 校验归属并创建 frozen ExecutionC
 - MCP request_id：一次工具结果标识，operation_id + attempt_no 进一步关联传输尝试。
 - workflow.operation_key：原后端稳定退款业务幂等键，不能用以上键替换。
 
-重复的终态请求返回原持久化响应和 invocation_id；正在运行的返回 processing=true 和可查询 ID，不再驱动图。原响应是脱敏快照。**预览 nonce 仍只在首次响应交付，不进入数据库/Trace/checkpoint**，重放的 pending_confirmation 带 confirmation_credential_available=false；客户端必须保留首次 nonce，丢失需按原业务规则重新申请。受理确认重放能返回原退款编号。
+重复的终态请求返回原持久化响应和 invocation_id，仍为 UNKNOWN_OUTCOME 的聊天写入可以继续只读核对原回执。正在运行的请求返回 processing=true 和可查询 ID。原响应是脱敏快照。**预览 nonce 明文只在首次响应交付**，重放的 pending_confirmation 带 confirmation_credential_available=false。客户端必须保留首次 nonce，丢失可取消原预览后重新申请。受理确认重放能返回原退款编号。
 
 新增 `GET /api/v1/invocations/{invocation_id}` 仅供本人查询状态、预算和脱敏响应。错误响应仍保留原 envelope，在 error 中可附 invocation_id / trace_id。API 的缺 LLM 配置为 CONFIG_ERROR；旧 Python Agent.chat 兼容帮助方法保留 LLM_NOT_CONFIGURED 等旧错误别名，内部同样经过 Harness。
 
@@ -53,9 +53,9 @@ API Auth 生成可信 Principal，Facade 校验归属并创建 frozen ExecutionC
 
 PolicyGuard 使用原 Skill Manager 可信白名单和严格工具参数 Schema。敏感退款只能经独立 execute_refund_from_workflow 能力路径；传 source='workflow' 无效。确认状态、订单/金额/版本及最终事务仍由原 Business 独立核验。成功工具数据也校验类型、订单/租户范围；退款必须能核对实际 DB 回执，不能仅相信工具自报成功。
 
-每次 Loop 模型决策计一步，传输重试不增加该计数。工具顺序执行并单独计数；重复提议、严重错误、待确认和达到预算均停止。`loop.*` 记录提议、策略结果、观察和终止；取消或超时会记录尚未观察的调用 ID。
+每次 Loop 模型决策计一步，传输重试不增加该计数。LangGraph 在执行模型提议的下一项工具前同步写入检查点，包含原 invocation ID、批次游标、计数、已观察结果、动作签名和检索证据。处理重复提议、严重错误、待确认和预算上限时会结束剩余执行，并为被跳过的提议保留协议观察。`loop.*` 记录提议、策略结果、观察和终止；取消或超时会记录尚未观察的调用 ID。
 
-每个组件使用 min(组件超时, remaining deadline)。读取消停止后续执行；开始写之前持久化 write_started 与原 workflow/operation 引用，再保留受控任务，断连不伪造业务取消、不换 key。进程消失时不宣称 shield 能保证执行：下次显式重试发现不属于当前进程的未终结请求，写请求标 UNKNOWN_OUTCOME，不重新派发；通过新的显式确认/状态查询核对原业务。不会启动时批量提交等待中的退款。
+每个组件使用 min(组件超时, remaining deadline)。读取消停止后续执行。工单发出前持久化 write_started，并用原 invocation ID 派生幂等工单号。退款预览在创建或复用时，在同一个 SQLite 事务中把 workflow_id 关联到 invocation。进程退出后，用同一 `request_id` 和原请求体显式重试，Harness 按当前用户和会话核对工单或退款预览，找到回执时返回原业务 ID 和 `recovered=true`。查不到回执的写请求返回 UNKNOWN_OUTCOME，后续同键重试可再次核对。对账只读业务库。普通会话检查点用于保留执行进度，任意中断处的模型推理续跑暂未提供。独立退款图仍由显式确认恢复，服务端先检查原确认凭据，再准备未写完的确认检查点。
 
 ## Context Manager
 

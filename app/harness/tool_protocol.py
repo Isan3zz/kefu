@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, ToolMessage
 
+MAX_TOOL_BATCH = 24
 
 @dataclass(frozen=True)
 class ModelDecision:
@@ -16,7 +17,7 @@ def decision_from_response(message, model_id, finish_reason):
     calls, invalid, sequence, seen = [], [], [], set()
     if finish_reason in ('length', 'content_filter'):
         raise ValueError('Incomplete tool decision')
-    if len(message.tool_calls or ()) > 24:
+    if len(message.tool_calls or ()) > MAX_TOOL_BATCH:
         raise ValueError('Tool batch exceeds protocol capacity')
     for call in message.tool_calls or ():
         if call.type != 'function' or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', call.id or '') or call.id in seen:

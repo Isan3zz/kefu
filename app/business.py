@@ -53,7 +53,7 @@ class Business:
             elif not timedelta(0)<=self.clock()-datetime.fromisoformat(o['delivered_at'])<=timedelta(days=7): reason="EXPIRED"
         elif o['status']!="PAID": reason="INVALID_STATUS"
         return dict(eligible=reason=="ELIGIBLE",reason_code=reason,amount_cents=o['paid_amount_cents'],policy_version=self.policy,requires_human=reason in ("HUMAN_REVIEW","MISSING_DELIVERY_TIME"))
-    def preview(self,a,conv,oid,*,reuse_pending=False):
+    def preview(self,a,conv,oid,*,reuse_pending=False,invocation_id=None):
         with self.db.tx() as c:
             self.owned(c,conversations,a,conv)
             e=self.eligibility(c,a,oid)
@@ -67,12 +67,34 @@ class Business:
                     workflow_instances.c.amount_cents==e['amount_cents'],workflow_instances.c.policy_version==self.policy,
                     workflow_instances.c.nonce_expires_at>self.clock().isoformat()).order_by(workflow_instances.c.updated_at.desc())).mappings().first()
                 if prior:
+                    self._link_preview(c,a,conv,invocation_id,prior['id'])
                     return dict(workflow_id=prior['id'],order_id=oid,amount_cents=prior['amount_cents'],
                                 status=prior['status'],confirmation_credential_available=False)
             nonce=secrets.token_urlsafe(32); wid=uid("wf-")
             row=dict(id=wid,tenant_id=a.tenant_id,user_id=a.user_id,conversation_id=conv,graph_thread_id="wf:"+wid,type="refund",status="WAITING_CONFIRMATION",order_id=oid,amount_cents=e['amount_cents'],policy_version=self.policy,confirm_nonce_hash=digest(nonce),nonce_expires_at=(self.clock()+timedelta(minutes=15)).isoformat(),operation_key=wid+":refund",order_version=o['version'],version=1,updated_at=now())
             c.execute(workflow_instances.insert().values(**row))
+            self._link_preview(c,a,conv,invocation_id,wid)
             return {"workflow_id":wid,"order_id":oid,"amount_cents":e['amount_cents'],"confirm_nonce":nonce,"status":row['status']}
+    def _link_preview(self,c,a,conv,invocation_id,wid):
+        if invocation_id is None:
+            return
+        changed=c.execute(agent_invocations.update().where(
+            agent_invocations.c.invocation_id==invocation_id,agent_invocations.c.conversation_id==conv,
+            agent_invocations.c.tenant_id==a.tenant_id,agent_invocations.c.user_id==a.user_id,
+            agent_invocations.c.status=='RUNNING',agent_invocations.c.graph_thread_id=='conv:'+conv,
+        ).values(workflow_id=wid,write_started=1,updated_at=now()))
+        if changed.rowcount != 1:
+            raise DomainError("NOT_FOUND")
+    def preview_outcome(self,c,a,conv,wid):
+        w=c.execute(select(workflow_instances).where(
+            workflow_instances.c.id==wid,workflow_instances.c.conversation_id==conv,
+            workflow_instances.c.tenant_id==a.tenant_id,workflow_instances.c.user_id==a.user_id,
+            workflow_instances.c.type=='refund')).mappings().first()
+        if w is None:
+            return None
+        return dict(workflow_id=wid,order_id=w['order_id'],amount_cents=w['amount_cents'],status=w['status'],
+                    confirmation_credential_available=False,
+                    confirmation_expired=datetime.fromisoformat(w['nonce_expires_at'])<=self.clock())
     def workflow(self,a,wid):
         with self.db.tx() as c:
             row=self.owned(c,workflow_instances,a,wid)
@@ -114,6 +136,14 @@ class Business:
             if w['status'] not in ("WAITING_CONFIRMATION","CANCELLED"): raise DomainError("BUSINESS_RULE_FAILED")
             c.execute(workflow_instances.update().where(workflow_instances.c.id==wid).values(status="CANCELLED",updated_at=now()))
         return self.workflow(a,wid)
+    @staticmethod
+    def ticket_id(a,conv,invocation_id):
+        return 'ticket-'+digest(f"{a.tenant_id}:{a.user_id}:{conv}:{invocation_id}")[:24]
+    def ticket_outcome(self,c,a,conv,invocation_id):
+        tid=self.ticket_id(a,conv,invocation_id)
+        row=c.execute(select(tickets.c.status).where(tickets.c.id==tid,tickets.c.tenant_id==a.tenant_id,
+            tickets.c.user_id==a.user_id,tickets.c.conversation_id==conv)).first()
+        return dict(ticket_id=tid,status=row.status) if row else None
     def tool(self,a,name,args):
         if name=="submit_refund_request": return self.submit(a,args['workflow_id'])
         with self.db.tx() as c:
@@ -133,10 +163,10 @@ class Business:
                 return [dict(r) for r in c.execute(select(products).where(products.c.tenant_id==a.tenant_id,products.c.name.contains(args.get('keyword',''))).limit(min(max(int(args.get('limit',10)),1),20))).mappings()]
             if name=="create_ticket":
                 self.owned(c,conversations,a,args['conversation_id'])
-                tid='ticket-'+digest(f"{a.tenant_id}:{a.user_id}:{args['conversation_id']}:{a.ticket_operation}")[:24] if a.ticket_operation else uid('ticket-')
                 if a.ticket_operation:
-                    old=c.execute(select(tickets.c.status).where(tickets.c.id==tid,tickets.c.tenant_id==a.tenant_id,tickets.c.user_id==a.user_id)).scalar()
-                    if old: return dict(ticket_id=tid,status=old)
+                    old=self.ticket_outcome(c,a,args['conversation_id'],a.ticket_operation)
+                    if old: return old
+                tid=self.ticket_id(a,args['conversation_id'],a.ticket_operation) if a.ticket_operation else uid('ticket-')
                 c.execute(tickets.insert().values(id=tid,tenant_id=a.tenant_id,user_id=a.user_id,conversation_id=args['conversation_id'],summary=args['summary'][:2000],reason=args['category'][:100],status="OPEN",created_at=now()))
                 return dict(ticket_id=tid,status="OPEN")
             raise DomainError("INVALID_ARGUMENT")

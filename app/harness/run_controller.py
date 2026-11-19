@@ -35,12 +35,15 @@ class RunController:
                 old=c.execute(select(agent_invocations).where(agent_invocations.c.tenant_id==p.tenant_id,agent_invocations.c.user_id==p.user_id,agent_invocations.c.conversation_id==conversation_id,agent_invocations.c.client_request_id==client_request_id)).mappings().first()
                 if old:
                     if old['request_body_hash']!=body_hash: raise DomainError('REQUEST_CONFLICT','同一 request_id 不能用于不同请求')
-                    if old['status'] in ('CREATED','RUNNING') and old['invocation_id'] not in self.active:
-                        # Explicit retry after restart: never redispatch an abandoned write.
-                        status='UNKNOWN_OUTCOME' if old['write_started'] else 'FAILED'
-                        response={'invocation_id':old['invocation_id'],'trace_id':old['trace_id'],'invocation_status':status,'error_code':'UNKNOWN_OUTCOME' if old['write_started'] else 'INTERNAL_ERROR','answer':'原执行进程状态不可确认，请查询原工作流或使用新的请求显式恢复'}
-                        c.execute(agent_invocations.update().where(agent_invocations.c.invocation_id==old['invocation_id']).values(status=status,error_code=response['error_code'],response_json=json.dumps(response,ensure_ascii=False),finished_at=now(),updated_at=now()))
-                        return None,response
+                    abandoned=old['status'] in ('CREATED','RUNNING') and old['invocation_id'] not in self.active
+                    unresolved=old['status']=='UNKNOWN_OUTCOME' and old['write_started'] and body.get('kind')=='chat'
+                    if abandoned or unresolved:
+                        response=self.reconcile_abandoned(c,p,old,body.get('kind'))
+                        if abandoned or response.get('recovered'):
+                            c.execute(agent_invocations.update().where(agent_invocations.c.invocation_id==old['invocation_id']).values(
+                                status=response['invocation_status'],error_code=response['error_code'],
+                                response_json=json.dumps(response,ensure_ascii=False),finished_at=old['finished_at'] or now(),updated_at=now()))
+                            return None,response
                     response=json.loads(old['response_json']) if old['response_json'] else {'invocation_id':old['invocation_id'],'trace_id':old['trace_id'],'status':old['status'],'processing':True}
                     return None,response
             if workflow_id:
@@ -50,6 +53,31 @@ class RunController:
         self.active.add(ident)
         evaluation=evaluation or {}
         return ExecutionContext(invocation_id=ident,trace_id=trace,conversation_id=conversation_id,graph_thread_id=graph_thread_id,principal=p,agent_release_id=self.config.agent_release_id,deadline_monotonic=time.monotonic()+self.config.agent_timeout_seconds,workflow_id=workflow_id,parent_invocation_id=parent,mode=mode,evaluation_case_id=evaluation.get('case_id'),evaluation_run_id=evaluation.get('run_id')),None
+
+    def reconcile_abandoned(self,c,principal,old,kind):
+        conv=old['conversation_id']
+        response=dict(invocation_id=old['invocation_id'],trace_id=old['trace_id'],conversation_id=conv)
+        if old['write_started'] and kind=='chat':
+            if old['workflow_id']:
+                preview=self.b.preview_outcome(c,principal,conv,old['workflow_id'])
+                if preview:
+                    expired=preview.pop('confirmation_expired')
+                    status=preview['status']
+                    waiting=status=='WAITING_CONFIRMATION' and not expired
+                    answer=('原退款申请仍待确认，请使用原确认按钮。如凭据丢失，请取消后重新申请。' if waiting
+                            else '已找到原退款工作流，请查看当前状态。')
+                    return dict(response,workflow_id=preview['workflow_id'],workflow_status=status,
+                                pending_confirmation=preview if waiting else None,answer=answer,
+                                invocation_status='INTERRUPTED' if waiting else 'SUCCEEDED',
+                                terminal_reason='PENDING_APPROVAL' if waiting else 'COMPLETED',
+                                error_code=None,recovered=True)
+            ticket=self.b.ticket_outcome(c,principal,conv,old['invocation_id'])
+            if ticket:
+                return dict(response,**ticket,answer='已创建人工工单：'+ticket['ticket_id']+'。',
+                            invocation_status='SUCCEEDED',terminal_reason='HANDOFF',error_code=None,recovered=True)
+        return dict(response,invocation_status='UNKNOWN_OUTCOME' if old['write_started'] else 'FAILED',
+                    error_code='UNKNOWN_OUTCOME' if old['write_started'] else 'INTERNAL_ERROR',
+                    answer='原执行进程状态不可确认，请查询原工作流或使用新的请求显式恢复')
     def update(self,ctx,**values):
         if 'status' in values:
             from app.harness.contracts import InvocationStatus

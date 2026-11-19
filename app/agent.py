@@ -13,7 +13,7 @@ from app.business import DomainError
 from app.db import *
 from app.skills import SkillManager
 from app.rag import RAG
-from app.observability import active_trace, clean
+from app.observability import active_trace
 from app.memory.service import MemoryService
 from app.memory.trigger import management_request, recommendation_request, save_request_only
 
@@ -98,6 +98,7 @@ class Agent:
         return await self.harness.invoke_chat(principal=a,conversation_id=conv,message=text,mode=mode,skill_mode=skill_mode,client_request_id=request_id,legacy=True)
     async def _chat(self,a,conv,text,mode,skill_mode,ctx,services):
         from app.agent_loop import AgentLoop
+        from app.harness.tool_protocol import MAX_TOOL_BATCH
         recorder=active_trace.get()
         trace_id=recorder.trace_id
         try:
@@ -117,10 +118,9 @@ class Agent:
         else:
             async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
                 compiled=loop.graph().compile(checkpointer=saver)
-                result=await compiled.ainvoke(dict(conversation_id=conv,message=text,tenant_id=a.tenant_id,user_id=a.user_id,messages=history,active_workflow_id=active),{'configurable':{'thread_id':'conv:'+conv},'recursion_limit':max(16,self.config.agent_max_steps*4)})
-                # Do not retain plaintext confirmation credentials in graph checkpoints.
-                if result.get('pending_confirmation'):
-                    await compiled.aupdate_state({'configurable':{'thread_id':'conv:'+conv}},{'pending_confirmation':clean(result['pending_confirmation'])})
+                config = {'configurable':{'thread_id':ctx.graph_thread_id},
+                          'recursion_limit':self.config.agent_max_steps*(1+MAX_TOOL_BATCH)+4}
+                result=await compiled.ainvoke(dict(conversation_id=conv,message=text,tenant_id=a.tenant_id,user_id=a.user_id,messages=history,active_workflow_id=active),config,durability='sync')
         mid, source_id = uid('msg-'), uid('msg-')
         memory_dispatch = None
         with self.b.db.tx() as c:
@@ -148,7 +148,10 @@ class Agent:
             self.memory.event('skipped', reason_code='MEMORY_EXTRACTION_ERROR', error_type=type(error).__name__)
         budget=services.budget
         usage={'source':'provider','input_tokens':budget.prompt_tokens,'output_tokens':budget.completion_tokens} if budget.model_calls and budget.provider_usage_complete else {'source':'unavailable','estimated_budget_consumed':budget.token_estimate_spent}
-        return dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=loop.pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None))
+        pending = result.get('pending_confirmation')
+        if pending and loop.confirmation_nonce:
+            pending = {**pending, 'confirm_nonce':loop.confirmation_nonce}
+        return dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None))
     async def commit_refund(self,a,wid,ctx=None,services=None):
         if ctx is None or services is None: raise DomainError('FORBIDDEN','退款提交必须经过 Harness workflow 能力入口')
         previous=self.b.workflow(a,wid)['status']
@@ -174,8 +177,8 @@ class Agent:
             async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
                 graph=self.refund_graph(a,saver,ctx,services); config={'configurable':{'thread_id':'wf:'+wid}}
                 state=await graph.aget_state(config)
-                if not state.values:
-                    await graph.ainvoke({'workflow_id':wid},config)
+                if not state.values or ('confirmation' in state.next and not state.interrupts):
+                    await graph.ainvoke(None if state.values else {'workflow_id':wid},config,durability='sync')
                     state=await graph.aget_state(config)
                 if not state.interrupts or state.interrupts[0].value['kind']!='refund_confirmation': raise DomainError('SYSTEM_ERROR','工作流未持久化确认中断')
                 if services: services.telemetry.emit('workflow.interrupted',workflow_id=wid,graph_thread_id='wf:'+wid,interrupt_kind='refund_confirmation')
@@ -206,8 +209,8 @@ class Agent:
         async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
             graph=self.refund_graph(a,saver,ctx,services); config={'configurable':{'thread_id':w['graph_thread_id']}}
             state=await graph.aget_state(config)
-            if not state.values:
-                await graph.ainvoke({'workflow_id':wid},config)
+            if not state.values or ('confirmation' in state.next and not state.interrupts):
+                await graph.ainvoke(None if state.values else {'workflow_id':wid},config,durability='sync')
                 state=await graph.aget_state(config)
             services.telemetry.emit('workflow.resumed',workflow_id=wid,graph_thread_id=w['graph_thread_id'],new_invocation_id=ctx.invocation_id)
             if state.next:
