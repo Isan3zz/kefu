@@ -1,0 +1,1 @@
+{"schema_version": "1.0", "case_id": "kbv3-052", "category": "retrieval", "fixture": "user_a_delivered_refundable", "query": "租户 B 的基础耳机有没有专属配对说明？", "expected": {"gold_chunks": ["76542300022ad4bcea34390c"]}, "tags": ["rag-v3", "tenant_specific"]}

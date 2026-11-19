@@ -1,5 +1,6 @@
 """Validated evaluation contracts; typos must not silently reduce assertions."""
 import json
+import re
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -38,7 +39,8 @@ class Case(BaseModel):
     schema_version:Literal['1.0']
     case_id:str=Field(pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
     category:Literal['intent','skill','workflow','safety','retrieval','agent_loop']
-    fixture:Literal['user_a_delivered_refundable']='user_a_delivered_refundable'
+    fixture:str='user_a_delivered_refundable'
+    actor_user_id:Literal['user_a','user_b','admin']|None=None
     expected:dict
     steps:list[Step]|None=None
     messages:list[Message]|None=None
@@ -48,6 +50,8 @@ class Case(BaseModel):
     @model_validator(mode='after')
     def contract(self):
         if not self.expected: raise ValueError('Expected assertions cannot be empty')
+        if self.fixture!='user_a_delivered_refundable' and not re.fullmatch(r'orders_boundary:(?:all|O30(?:0[1-9]|[1-4][0-9]|50)|[a-z][a-z0-9_]*)',self.fixture):
+            raise ValueError('Unknown fixture selector: '+self.fixture)
         unknown=set(self.expected)-EXPECTED_FIELDS
         if unknown: raise ValueError('Unknown expected labels: '+', '.join(sorted(unknown)))
         if self.steps and self.messages: raise ValueError('Choose steps or messages, not both')

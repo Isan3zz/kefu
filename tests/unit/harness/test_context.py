@@ -16,7 +16,7 @@ async def test_H20_three_layers_preserve_facts_refs_and_original_history(env):
     with env['db'].tx() as c:
         for m in history: c.execute(messages.insert().values(**m,conversation_id=env['conv'],created_at=now()))
     evidence=[{'chunk_id':'chunk-ref','version':'v1','document_title':'政策','content':'申请需确认。'}]
-    tools=[{'name':'get_order','result':{'ok':True,'request_id':'req1','data':{'id':'O1001','status':'DELIVERED','verbose':'X'*20000,'phone':'13900000000'}}}]*4
+    tools=[{'name':'get_order','result':{'ok':True,'request_id':'req1','data':{'id':'O1001','status':'DELIVERED','verbose':'X'*20000,'phone':'13912345678'}}}]*4
     cfg=env['cfg'].model_copy(update={'context_recent_message_limit':1})
     manager=ContextManager(env['b'],cfg)
     output=await manager.build_context(ctx=ctx,task_state={'active_workflow_id':p['workflow_id'],'workflow_state':'REQUEST_ACCEPTED','message':'查一下进度'},recent_messages=history,selected_skill={'name':'refund-processing','instructions':'先验证本人订单并等待明确确认','version':'1'},evidence=evidence,tool_results=tools,budget=ContextBudget(model_context_window=16000,reserved_output_tokens=2000,safety_margin_tokens=1000,max_input_tokens=11000))
@@ -27,7 +27,7 @@ async def test_H20_three_layers_preserve_facts_refs_and_original_history(env):
     assert payload['current_task']['verified_workflow']['status']=='WAITING_CONFIRMATION'
     assert payload['history_summary']['semantic_summary_generated'] is False
     assert payload['evidence'][0]['chunk_id']=='chunk-ref'
-    assert '13900000000' not in json.dumps(output.model_dump())
+    assert '13912345678' not in json.dumps(output.model_dump())
     with env['db'].tx() as c: assert c.scalar(select(func.count()).select_from(messages))==30
     # Exact source is reused; updated authoritative business state invalidates the summary.
     assert manager.read_summary(ctx,output.summary_id)['summary_version']=='verified-facts-v1'

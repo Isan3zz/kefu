@@ -1,0 +1,182 @@
+[
+  {
+    "id": "headphones-a",
+    "tenant_id": "a",
+    "name": "云听耳机",
+    "category": "headphones",
+    "price_cents": 29900,
+    "stock": 20,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-BASE\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":\"IPX4\",\"colors\":[\"黑色\",\"蓝色\"],\"warranty_months\":12,\"usage_scenarios\":[\"日常听歌\",\"通勤\"],\"features\":[\"触控操作\",\"基础蓝牙连接\"]}"
+  },
+  {
+    "id": "yt-lite-tws",
+    "tenant_id": "a",
+    "name": "云听 Lite 真无线耳机",
+    "category": "headphones",
+    "price_cents": 15900,
+    "stock": 46,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-LITE\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":24,\"water_resistance\":\"IPX4\",\"colors\":[\"白色\",\"薄荷绿\"],\"warranty_months\":12,\"usage_scenarios\":[\"入门选购\",\"日常通勤\"],\"features\":[\"轻量充电盒\"]}"
+  },
+  {
+    "id": "yt-mini-tws",
+    "tenant_id": "a",
+    "name": "云听 Mini 轻巧耳机",
+    "category": "headphones",
+    "price_cents": 19900,
+    "stock": 0,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-MINI\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":20,\"water_resistance\":\"IPX4\",\"colors\":[\"粉色\",\"白色\"],\"warranty_months\":12,\"usage_scenarios\":[\"小耳廓\",\"通话\"],\"features\":[\"小尺寸耳塞\",\"轻巧设计\"]}"
+  },
+  {
+    "id": "yt-air-anc",
+    "tenant_id": "a",
+    "name": "云听 Air ANC 降噪耳机",
+    "category": "headphones",
+    "price_cents": 39900,
+    "stock": 18,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-AIR-ANC\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":true,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":32,\"water_resistance\":\"IPX4\",\"colors\":[\"黑色\",\"米白色\"],\"warranty_months\":12,\"usage_scenarios\":[\"地铁通勤\",\"日常听歌\"],\"features\":[\"主动降噪\",\"通透模式\"]}"
+  },
+  {
+    "id": "yt-office-headset",
+    "tenant_id": "a",
+    "name": "云听 Office 头戴通话耳机",
+    "category": "headphones",
+    "price_cents": 45900,
+    "stock": 12,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-OFFICE\",\"form_factor\":\"头戴式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":true,\"call_noise_reduction\":true,\"multipoint\":true,\"battery_hours\":38,\"water_resistance\":null,\"colors\":[\"黑色\",\"深灰色\"],\"warranty_months\":12,\"usage_scenarios\":[\"办公室会议\",\"远程办公\"],\"features\":[\"双设备连接\",\"麦克风降噪\",\"可调节头梁\"]}"
+  },
+  {
+    "id": "yt-pro-headset",
+    "tenant_id": "a",
+    "name": "云听 Pro 头戴降噪耳机",
+    "category": "headphones",
+    "price_cents": 69900,
+    "stock": 9,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-PRO\",\"form_factor\":\"头戴式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":true,\"call_noise_reduction\":true,\"multipoint\":true,\"battery_hours\":50,\"water_resistance\":null,\"colors\":[\"黑色\",\"银色\"],\"warranty_months\":18,\"usage_scenarios\":[\"长时间办公\",\"旅行\"],\"features\":[\"主动降噪\",\"佩戴检测\",\"双设备连接\"]}"
+  },
+  {
+    "id": "yt-studio-headset",
+    "tenant_id": "a",
+    "name": "云听 Studio 监听头戴耳机",
+    "category": "headphones",
+    "price_cents": 129900,
+    "stock": 4,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-STUDIO\",\"form_factor\":\"头戴式\",\"connection_type\":\"wired\",\"bluetooth_version\":null,\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"黑色\"],\"warranty_months\":24,\"usage_scenarios\":[\"录音监听\",\"有线音频制作\"],\"features\":[\"3.5mm 有线连接\",\"可拆卸音频线\",\"封闭式耳罩\"]}"
+  },
+  {
+    "id": "yt-open-ear",
+    "tenant_id": "a",
+    "name": "云听 Open 开放式运动耳机",
+    "category": "headphones",
+    "price_cents": 34900,
+    "stock": 30,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-OPEN\",\"form_factor\":\"开放式挂耳\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":28,\"water_resistance\":\"IPX5\",\"colors\":[\"橙色\",\"黑色\"],\"warranty_months\":12,\"usage_scenarios\":[\"户外步行\",\"运动\"],\"features\":[\"开放式聆听\",\"运动防汗\"]}"
+  },
+  {
+    "id": "yt-run-bone",
+    "tenant_id": "a",
+    "name": "云听 Run 骨传导运动耳机",
+    "category": "headphones",
+    "price_cents": 49900,
+    "stock": 0,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-RUN\",\"form_factor\":\"骨传导\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":10,\"water_resistance\":\"IPX6\",\"colors\":[\"黑色\",\"荧光绿\"],\"warranty_months\":12,\"usage_scenarios\":[\"跑步\",\"户外健身\"],\"features\":[\"开放双耳\",\"运动防汗\"]}"
+  },
+  {
+    "id": "yt-game-lowlatency",
+    "tenant_id": "a",
+    "name": "云听 Game 低延迟耳机",
+    "category": "headphones",
+    "price_cents": 32900,
+    "stock": 16,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-GAME\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.4\",\"active_noise_cancellation\":false,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":30,\"water_resistance\":\"IPX4\",\"colors\":[\"黑红色\",\"白色\"],\"warranty_months\":12,\"usage_scenarios\":[\"手机游戏\",\"视频\"],\"features\":[\"低延迟模式\",\"游戏音效\"]}"
+  },
+  {
+    "id": "yt-usbc-wired",
+    "tenant_id": "a",
+    "name": "云听 Type-C 有线耳机",
+    "category": "headphones",
+    "price_cents": 12900,
+    "stock": 55,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-USBC\",\"form_factor\":\"有线入耳式\",\"connection_type\":\"usb-c\",\"bluetooth_version\":null,\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"黑色\",\"白色\"],\"warranty_months\":6,\"usage_scenarios\":[\"有线通话\",\"不便充电场景\"],\"features\":[\"USB-C 数字音频\",\"无需充电\"]}"
+  },
+  {
+    "id": "yt-clip-ear",
+    "tenant_id": "a",
+    "name": "云听 Clip 耳夹式耳机",
+    "category": "headphones",
+    "price_cents": 27900,
+    "stock": 22,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-CLIP\",\"form_factor\":\"耳夹式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":true,\"multipoint\":false,\"battery_hours\":26,\"water_resistance\":\"IPX4\",\"colors\":[\"香槟金\",\"黑色\"],\"warranty_months\":12,\"usage_scenarios\":[\"休闲佩戴\",\"通勤\"],\"features\":[\"开放式设计\",\"不入耳\"]}"
+  },
+  {
+    "id": "yt-travel-anc",
+    "tenant_id": "a",
+    "name": "云听 Travel 长续航降噪耳机",
+    "category": "headphones",
+    "price_cents": 54900,
+    "stock": 13,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-TRAVEL\",\"form_factor\":\"头戴式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":true,\"call_noise_reduction\":false,\"multipoint\":true,\"battery_hours\":55,\"water_resistance\":null,\"colors\":[\"深蓝色\",\"黑色\"],\"warranty_months\":18,\"usage_scenarios\":[\"长途旅行\",\"通勤\"],\"features\":[\"主动降噪\",\"可折叠设计\",\"双设备连接\"]}"
+  },
+  {
+    "id": "yt-ultra-anc",
+    "tenant_id": "a",
+    "name": "云听 Ultra 旗舰降噪耳机",
+    "category": "headphones",
+    "price_cents": 99900,
+    "stock": 0,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-ULTRA\",\"form_factor\":\"真无线入耳式\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.4\",\"active_noise_cancellation\":true,\"call_noise_reduction\":true,\"multipoint\":true,\"battery_hours\":40,\"water_resistance\":\"IPX4\",\"colors\":[\"曜石黑\",\"钛灰色\"],\"warranty_months\":24,\"usage_scenarios\":[\"商务出行\",\"通勤\"],\"features\":[\"自适应降噪\",\"双设备连接\",\"无线充电\"]}"
+  },
+  {
+    "id": "yt-pocket-speaker",
+    "tenant_id": "a",
+    "name": "云听 Pocket 便携蓝牙音箱",
+    "category": "speakers",
+    "price_cents": 17900,
+    "stock": 35,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-POCKET\",\"form_factor\":\"便携音箱\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":10,\"water_resistance\":\"IPX5\",\"colors\":[\"黑色\",\"蓝色\"],\"warranty_months\":12,\"usage_scenarios\":[\"户外野餐\",\"宿舍\"],\"features\":[\"便携挂绳\",\"单声道\"]}"
+  },
+  {
+    "id": "yt-home-speaker",
+    "tenant_id": "a",
+    "name": "云听 Home 桌面蓝牙音箱",
+    "category": "speakers",
+    "price_cents": 39900,
+    "stock": 15,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-HOME\",\"form_factor\":\"桌面音箱\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"白色\",\"木纹色\"],\"warranty_months\":12,\"usage_scenarios\":[\"桌面办公\",\"居家\"],\"features\":[\"双声道\",\"USB-C 供电\"]}"
+  },
+  {
+    "id": "yt-outdoor-speaker",
+    "tenant_id": "a",
+    "name": "云听 Outdoor 防水蓝牙音箱",
+    "category": "speakers",
+    "price_cents": 59900,
+    "stock": 0,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-OUTDOOR\",\"form_factor\":\"户外音箱\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":18,\"water_resistance\":\"IP67\",\"colors\":[\"军绿色\",\"黑色\"],\"warranty_months\":18,\"usage_scenarios\":[\"露营\",\"户外活动\"],\"features\":[\"防尘防水\",\"低音增强\"]}"
+  },
+  {
+    "id": "yt-30w-charger",
+    "tenant_id": "a",
+    "name": "云听 30W USB-C 充电器",
+    "category": "accessories",
+    "price_cents": 7900,
+    "stock": 80,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-CH30\",\"form_factor\":\"充电器\",\"connection_type\":\"usb-c\",\"bluetooth_version\":null,\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"白色\"],\"warranty_months\":12,\"usage_scenarios\":[\"设备充电\"],\"features\":[\"30W 输出\",\"单口 USB-C\"],\"compatibility_note\":\"实际适配功率以设备说明为准\"}"
+  },
+  {
+    "id": "yt-ear-tips",
+    "tenant_id": "a",
+    "name": "云听 耳机硅胶耳塞套装",
+    "category": "accessories",
+    "price_cents": 3900,
+    "stock": 100,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-TIPS\",\"form_factor\":\"耳塞配件\",\"connection_type\":\"none\",\"bluetooth_version\":null,\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"黑色\",\"白色\"],\"warranty_months\":3,\"usage_scenarios\":[\"耳塞替换\"],\"features\":[\"S/M/L 三种尺寸\"],\"compatible_models\":[\"YT-BASE\",\"YT-LITE\",\"YT-AIR-ANC\"]}"
+  },
+  {
+    "id": "yt-bt-adapter",
+    "tenant_id": "a",
+    "name": "云听 蓝牙音频适配器",
+    "category": "accessories",
+    "price_cents": 14900,
+    "stock": 25,
+    "attributes_json": "{\"brand\":\"云听\",\"model\":\"YT-BT53\",\"form_factor\":\"音频适配器\",\"connection_type\":\"bluetooth\",\"bluetooth_version\":\"5.3\",\"active_noise_cancellation\":false,\"call_noise_reduction\":false,\"multipoint\":false,\"battery_hours\":null,\"water_resistance\":null,\"colors\":[\"黑色\"],\"warranty_months\":12,\"usage_scenarios\":[\"桌面电脑无线音频\"],\"features\":[\"USB-A 接口\",\"蓝牙音频接收\"],\"compatibility_note\":\"依赖主机操作系统和蓝牙驱动\"}"
+  }
+]

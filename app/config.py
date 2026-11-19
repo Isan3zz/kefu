@@ -11,6 +11,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    app_env: Literal["local", "test", "production"] = "local"
     demo_mode: bool = True
     agent_release_id: str = "local"
     sqlite_url: str = "sqlite:///./data/app.db"
@@ -27,7 +28,7 @@ class Settings(BaseSettings):
     retrieval_dense_k: int = 12
     retrieval_bm25_k: int = 12
     retrieval_rrf_k: int = 60
-    retrieval_rerank_k: int = 8
+    retrieval_rerank_k: int = 12
     retrieval_context_k: int = 4
     llm_base_url: str = ""
     llm_api_key: str = ""

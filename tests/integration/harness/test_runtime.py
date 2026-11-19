@@ -152,9 +152,9 @@ async def test_H19_sse_disconnect_after_committed_write_does_not_retry_or_cancel
     assert not any(r['invocation_status']=='CANCELLED' for r in records(env))
 
 async def test_H23_trace_schema_and_secret_redaction(env):
-    result=await env['agent'].chat(env['a'],env['conv'],'查订单 O1001；电话13900000000 Bearer raw-token sk-test-secret','deterministic')
+    result=await env['agent'].chat(env['a'],env['conv'],'查订单 O1001；电话13912345678 Bearer raw-token sk-test-secret','deterministic')
     record=records(env)[0]; encoded=json.dumps(record)
-    assert all(value not in encoded for value in ('13900000000','raw-token','sk-test-secret'))
+    assert all(value not in encoded for value in ('13912345678','raw-token','sk-test-secret'))
     for e in record['events']:
         assert e['invocation_id']==result['invocation_id']
         assert all(key in e for key in ('schema_version','trace_id','event_id','span_id','ts','attributes','conversation_id','graph_thread_id'))

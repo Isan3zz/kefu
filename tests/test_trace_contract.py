@@ -14,7 +14,7 @@ def payloads(env):
 
 async def test_missing_llm_config_is_audited_without_raw_input(env):
     with pytest.raises(DomainError):
-        await env['agent'].chat(env['a'],env['conv'],'private input 13900000000')
+        await env['agent'].chat(env['a'],env['conv'],'private input 13912345678')
     record=payloads(env)[0]
     assert record['errors'][0]['error_code']=='LLM_NOT_CONFIGURED'
     assert 'private input' not in json.dumps(record)
@@ -72,11 +72,11 @@ def test_redaction_keeps_usage_metrics():
     value=clean({'Authorization':'Bearer raw','api_key':'secret','confirm_nonce':'nonce','summary':'private','usage':{'prompt_tokens':123,'completion_tokens':45},'estimated_tokens':20})
     assert set(value)=={'usage','estimated_tokens'}
     assert value['usage']['prompt_tokens']==123
-    identifier='aa13900000000bbbbbbbbbbb'
+    identifier='aa13912345678bbbbbbbbbbb'
     assert clean({'chunk_id':identifier})['chunk_id']==identifier
     assert clean({'graph_thread_id':'conv:conv-'+identifier})['graph_thread_id']=='conv:conv-'+identifier
     assert clean({'operation_id':'model-op-'+identifier})['operation_id']=='model-op-'+identifier
-    assert clean({'note':'13900000000'})['note']=='[PHONE]'
+    assert clean({'note':'13912345678'})['note']=='[PHONE]'
 
 async def test_unknown_ticket_write_never_silently_returns_none_or_retries(env,monkeypatch):
     from app.db import tickets
