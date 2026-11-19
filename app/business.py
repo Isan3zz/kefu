@@ -2,6 +2,8 @@ import hmac
 import secrets
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from typing import Annotated
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 from app.db import *
 
@@ -16,6 +18,26 @@ class Actor:
     tenant_id: str
     role: str = "customer"
     ticket_operation: str | None = None
+
+
+PriceCents = Annotated[int, Field(strict=True, ge=0, le=(1 << 63) - 1)]
+
+
+class ProductSearch(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    keyword: str = Field(default='', max_length=1000)
+    limit: int = Field(default=10, ge=1, le=20)
+    min_price_cents: PriceCents | None = Field(default=None, description='Inclusive minimum price in cents.')
+    max_price_cents: PriceCents | None = Field(default=None, description='Inclusive maximum price in cents.')
+    in_stock_only: bool = Field(default=False, description='When true, return only products with stock greater than zero.')
+
+    @model_validator(mode='after')
+    def ordered_price_range(self):
+        if self.min_price_cents is not None and self.max_price_cents is not None and self.min_price_cents > self.max_price_cents:
+            raise ValueError('min_price_cents must be less than or equal to max_price_cents')
+        return self
+
 
 class Business:
     policy = "P-REFUND-v1"
@@ -160,7 +182,22 @@ class Business:
                 return [dict(r) for r in c.execute(select(shipments).where(shipments.c.order_id==args['order_id'])).mappings()]
             if name=="check_refund_eligibility": return self.eligibility(c,a,args['order_id'])
             if name=="search_products":
-                return [dict(r) for r in c.execute(select(products).where(products.c.tenant_id==a.tenant_id,products.c.name.contains(args.get('keyword',''))).order_by(products.c.id).limit(min(max(int(args.get('limit',10)),1),20))).mappings()]
+                try:
+                    limit = min(max(int(args.get('limit', 10)), 1), 20)
+                    search = ProductSearch.model_validate({**args, 'limit':limit})
+                except (TypeError, ValueError) as error:
+                    raise DomainError('INVALID_ARGUMENT', '商品筛选参数无效') from error
+                query = select(products).where(
+                    products.c.tenant_id == a.tenant_id,
+                    products.c.name.contains(search.keyword),
+                )
+                if search.min_price_cents is not None:
+                    query = query.where(products.c.price_cents >= search.min_price_cents)
+                if search.max_price_cents is not None:
+                    query = query.where(products.c.price_cents <= search.max_price_cents)
+                if search.in_stock_only:
+                    query = query.where(products.c.stock > 0)
+                return [dict(row) for row in c.execute(query.order_by(products.c.id).limit(search.limit)).mappings()]
             if name=="create_ticket":
                 self.owned(c,conversations,a,args['conversation_id'])
                 if a.ticket_operation:

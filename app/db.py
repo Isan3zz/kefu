@@ -89,6 +89,40 @@ memory_operations = table('memory_candidate_operations', Column('job_id', Foreig
     Column('memory_id', ForeignKey('user_memories.id')), s('created_at', nullable=False))
 MEMORY_TABLES = (memory_settings, memories, memory_revisions, memory_jobs, memory_pending, memory_operations)
 
+image_assets = table('image_assets', s('image_id', primary_key=True),
+    Column('tenant_id', ForeignKey('tenants.id'), nullable=False),
+    Column('owner_user_id', ForeignKey('users.id')),
+    Column('conversation_id', ForeignKey('conversations.id')),
+    s('source_type', nullable=False), s('file_rel_path', nullable=False, unique=True),
+    s('mime_type', nullable=False), s('sha256_hex', nullable=False),
+    i('width_px', nullable=False), i('height_px', nullable=False), i('byte_size', nullable=False),
+    s('status', nullable=False), s('created_at', nullable=False), s('expires_at'), s('deleted_at'),
+    CheckConstraint("source_type IN ('product','user_upload')"),
+    CheckConstraint("status IN ('ACTIVE','DELETED','FAILED')"),
+    CheckConstraint("(source_type = 'user_upload') = (owner_user_id IS NOT NULL)"))
+Index('ix_image_scope', image_assets.c.tenant_id, image_assets.c.owner_user_id, image_assets.c.status)
+product_images = table('product_images', Column('product_id', ForeignKey('products.id'), primary_key=True),
+    Column('image_id', ForeignKey('image_assets.image_id'), primary_key=True, unique=True),
+    s('image_role', nullable=False, server_default='main'))
+visual_text_records = table('visual_text_records', s('visual_text_id', primary_key=True),
+    Column('tenant_id', ForeignKey('tenants.id'), nullable=False),
+    Column('product_id', ForeignKey('products.id')), Column('doc_id', ForeignKey('documents.id')),
+    Column('text_content', Text, nullable=False), s('text_hash', nullable=False),
+    s('source_version', nullable=False), s('status', nullable=False),
+    CheckConstraint("status IN ('ACTIVE','DELETED')"))
+Index('ix_visual_text_scope', visual_text_records.c.tenant_id, visual_text_records.c.status)
+multimodal_index_jobs = table('multimodal_index_jobs', s('job_id', primary_key=True),
+    s('target_kind', nullable=False), s('target_id', nullable=False),
+    s('operation', nullable=False), s('content_version', nullable=False), s('status', nullable=False),
+    i('attempt_count', nullable=False, server_default='0'), s('last_error'), s('updated_at', nullable=False),
+    UniqueConstraint('target_kind', 'target_id', 'operation', 'content_version'),
+    CheckConstraint("target_kind IN ('product_image','visual_text','upload')"),
+    CheckConstraint("operation IN ('UPSERT','DELETE')"),
+    CheckConstraint("status IN ('PENDING','RUNNING','DONE','FAILED')"))
+Index('ix_multimodal_jobs_status', multimodal_index_jobs.c.status)
+MULTIMODAL_TABLES = (image_assets, product_images, visual_text_records, multimodal_index_jobs)
+
+
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix=""): return prefix + secrets.token_hex(12)
 def digest(value): return hashlib.sha256(value.encode()).hexdigest()

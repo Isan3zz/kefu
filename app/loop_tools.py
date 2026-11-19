@@ -17,9 +17,15 @@ DESCRIPTIONS = {
     'get_orders': 'List orders owned by the signed-in customer.',
     'get_order': 'Read one referenced order including existing refund status.',
     'track_shipment': 'Track the referenced order with live shipment facts.',
-    'search_products': 'Look up live catalog products by a name keyword. Results include current price, stock and product attributes such as fit, noise cancellation and device connections. Use an empty keyword if the catalog name is unknown.',
-    'check_refund_eligibility': 'Check refund eligibility only. For a specific request to start a refund, call begin_refund_workflow instead.',
-    'begin_refund_workflow': 'For an explicit refund application, check eligibility and prepare a user confirmation. Never submits refunds. Do not use for eligibility-only, status, acknowledgements or policy questions. Call alone.',
+    'search_products': (
+        'Search the live product catalog. The keyword matches the product name. Use an empty keyword if the name is unknown, '
+        'and inspect the returned attributes for requested features. Pass a stated budget as max_price_cents '
+        '(for example 500 yuan = 50000 cents), with min_price_cents for a stated lower bound. Both bounds are inclusive. '
+        'Pass in_stock_only=true when the customer needs available products. Omit it when checking whether a named '
+        'product is sold out so that items with zero stock are returned. Results include real prices, stock and attributes.'
+    ),
+    'check_refund_eligibility': 'Read one order’s refund eligibility and possible amount. Use for eligibility or amount questions, including when the customer asks to hold off. For multiple orders, report each result with its order ID.',
+    'begin_refund_workflow': 'Prepare a confirmation preview when the customer clearly asks to start a refund for a known order. Eligibility checks, status questions, acknowledgements and requests to hold off do not authorize a preview. Complete any other requested reads first, then call this tool alone. This tool never submits refunds.',
     'create_ticket': 'Create a human handoff ticket when explicitly requested (转人工/人工客服) or when a complaint needs escalation. Call alone.',
 }
 VISIBLE_SCHEMAS = {name: TicketProposal if name == 'create_ticket' else

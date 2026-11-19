@@ -77,13 +77,19 @@ class Agent:
     def __init__(self,business,gateway,config=settings,rag=None):
         self.b,self.gateway,self.config=business,gateway,config
         self.skills=SkillManager(); self.rag=rag or RAG(business.db,config=config)
+        from app.multimodal.images import ImageRepository
+        self.images = ImageRepository(business, config)
+        from app.multimodal.index import MultimodalIndex
+        self.multimodal_index = MultimodalIndex(self.images, self.rag.client)
+        from app.multimodal.retrieval import MultimodalRetrievalService
+        self.multimodal = MultimodalRetrievalService(self.multimodal_index)
         self._llm_client=None
         from app.harness.runtime import HarnessFacade
         self.harness=HarnessFacade(self)
         self.memory = MemoryService(business, self.rag, config,
                                     lambda mode: self.harness.fake_model if mode == 'deterministic' else self.harness.model)
     def llm(self):
-        if not all((self.config.llm_api_key,self.config.llm_base_url,self.config.llm_model)):
+        if not all((self.config.llm_api_key,self.config.llm_base_url,self.config.llm_model or self.config.vlm_model)):
             from app.harness.contracts import HarnessFailure
             raise HarnessFailure('CONFIG_ERROR','真实聊天需要配置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL；离线演示请显式选择 deterministic',source='model')
         from openai import AsyncOpenAI
@@ -97,9 +103,10 @@ class Agent:
     async def chat(self,a,conv,text,mode='real',skill_mode='selected',request_id=None):
         return await self.harness.invoke_chat(principal=a,conversation_id=conv,message=text,mode=mode,skill_mode=skill_mode,client_request_id=request_id,legacy=True)
     async def _chat(self,a,conv,text,mode,skill_mode,ctx,services):
-        from app.agent_loop import AgentLoop
+        from app.agent_loop import AgentLoop, PROMPT_VERSION
         from app.harness.tool_protocol import MAX_TOOL_BATCH
         recorder=active_trace.get()
+        recorder.payload['prompt_version']=PROMPT_VERSION
         trace_id=recorder.trace_id
         try:
             consent_generation=self.memory.consent_snapshot(ctx.principal)
@@ -113,7 +120,7 @@ class Agent:
             history=[dict(row) for row in reversed(rows)]
             active=connection.execute(select(workflow_instances.c.id).where(workflow_instances.c.conversation_id==conv,workflow_instances.c.user_id==a.user_id,workflow_instances.c.tenant_id==a.tenant_id,workflow_instances.c.status.in_(['WAITING_CONFIRMATION','CONFIRMED'])).order_by(workflow_instances.c.updated_at.desc()).limit(1)).scalar()
         recorder.emit('state_restore',history_messages=len(history),active_workflow_id=active)
-        if self.config.memory_enabled and (management_request(text) or save_request_only(text)):
+        if not services.image_ids and self.config.memory_enabled and (management_request(text) or save_request_only(text)):
             result = dict(intent='other', retrieved_chunks=[], tool_events=[], final_response='', terminal_reason='COMPLETED')
         else:
             async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
@@ -135,7 +142,7 @@ class Agent:
                                                 '已收到保存请求，将在校验后处理；请在长期记忆列表查看是否保存。')
             for ident,role,content in [(source_id,'user',text),(mid,'assistant',result['final_response'])]: c.execute(messages.insert().values(id=ident,conversation_id=conv,role=role,content=content,created_at=self.b.clock().isoformat(),trace_id=trace_id))
             c.execute(conversations.update().where(conversations.c.id==conv).values(updated_at=now()))
-            if self.config.memory_enabled:
+            if self.config.memory_enabled and not services.image_ids:
                 try:
                     with c.begin_nested():
                         memory_dispatch = self.memory.register_turn(c, ctx.principal, conv, source_id, mode, consent_generation)
@@ -151,7 +158,7 @@ class Agent:
         pending = result.get('pending_confirmation')
         if pending and loop.confirmation_nonce:
             pending = {**pending, 'confirm_nonce':loop.confirmation_nonce}
-        return dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None))
+        return dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None), **({'cards':result['cards']} if result.get('cards') is not None else {}))
     async def commit_refund(self,a,wid,ctx=None,services=None):
         if ctx is None or services is None: raise DomainError('FORBIDDEN','退款提交必须经过 Harness workflow 能力入口')
         previous=self.b.workflow(a,wid)['status']

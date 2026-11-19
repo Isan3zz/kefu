@@ -39,6 +39,9 @@ def clean(value):
     if isinstance(value, (list, tuple)):
         return [clean(v) for v in value]
     if isinstance(value, str):
+        if re.fullmatch(r'(?:/api/v1/images/)?[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}', value):
+            return value
+        value = re.sub(r'(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+', '[IMAGE_REDACTED]', value)
         value = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", value)
         value = re.sub(r"\bsk-[\w-]+", "[REDACTED]", value)
         return re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[PHONE]", value)

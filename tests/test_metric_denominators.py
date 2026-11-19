@@ -22,6 +22,9 @@ async def test_skill_negative_and_tool_case_denominators_are_distinct(env,tmp_pa
     assert report['metrics']['skill_false_activation_rate']['numerator']==0
     assert report['metrics']['skill_false_activation_rate']['denominator']==1
     assert report['metrics']['tool_selection_accuracy']['denominator']==1
+    assert [case['tool_call_count'] for case in report['cases']]==[0,1]
+    assert report['metrics']['avg_tool_calls_per_task']['value']==0.5
+    assert report['metrics']['avg_tool_calls_per_task']['denominator']==2
     assert report['agent_latency']['samples']==2
     assert report['duplicate_refund_count']==0
     text=(Path('data/eval_runs')/report['run_id']/'report.md').read_text(encoding='utf-8')

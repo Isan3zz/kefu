@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 from fastapi import FastAPI,Depends,Header,Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse,StreamingResponse,RedirectResponse
+from fastapi.responses import FileResponse,JSONResponse,StreamingResponse,RedirectResponse
 from pydantic import BaseModel,Field,ConfigDict
 from sqlalchemy import select
 from app.config import settings,ROOT
@@ -15,6 +15,7 @@ from app.business import Business,DomainError
 from app.mcp import Gateway
 from app.agent import Agent
 from app.memory.api import memory_router
+from app.multimodal.api import ERROR_STATUS, image_router, retrieval_router
 
 def create_app(config=settings,db=None,gateway=None,rag=None):
     db=db or DB(config.sqlite_url); db.initialize(); b=Business(db)
@@ -35,6 +36,7 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
     @app.exception_handler(DomainError)
     async def domain_error(request,e):
         status={'UNAUTHORIZED':401,'FORBIDDEN':403,'POLICY_DENIED':403,'NOT_FOUND':404,'INVALID_ARGUMENT':422,'LLM_NOT_CONFIGURED':503,'CONFIG_ERROR':503,'KNOWLEDGE_NOT_READY':503,'UPSTREAM_UNAVAILABLE':503,'TOOL_UPSTREAM_ERROR':503,'MODEL_UPSTREAM_ERROR':503,'MODEL_RATE_LIMIT':503,'MODEL_BAD_OUTPUT':502,'TOOL_BAD_RESULT':502,'SYSTEM_ERROR':500,'INTERNAL_ERROR':500,'TIMEOUT':504,'RUN_TIMEOUT':504,'MODEL_TIMEOUT':504,'TOOL_TIMEOUT':504}.get(e.code,409)
+        status = ERROR_STATUS.get(e.code, status)
         if e.code=='MODEL_TOOL_CALLING_UNSUPPORTED': status=503
         detail={'code':e.code,'message':e.message}
         if getattr(e,'invocation_id',None): detail.update(invocation_id=e.invocation_id,trace_id=e.trace_id)
@@ -51,6 +53,17 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
         if not authorization.startswith('Bearer '): raise DomainError('UNAUTHORIZED')
         return b.authenticate(authorization[7:])
     app.include_router(memory_router(agent.memory, actor, envelope))
+    if config.multimodal_enabled:
+        app.include_router(image_router(agent.images, agent.multimodal_index, actor, envelope))
+        app.include_router(retrieval_router(agent.multimodal, actor, envelope))
+
+        @app.get('/multimodal', include_in_schema=False)
+        def multimodal_console():
+            return FileResponse(Path(__file__).with_name('multimodal')/'console.html', media_type='text/html',
+                                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+                                         'Content-Security-Policy': "default-src 'self'; script-src 'unsafe-inline'; "
+                                                                    "style-src 'unsafe-inline'; img-src 'self' blob:; "
+                                                                    "frame-ancestors 'none'; base-uri 'none'"})
     def admin(a=Depends(actor)):
         if a.role!='admin': raise DomainError('FORBIDDEN')
         return a
@@ -80,15 +93,24 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
         message:str=Field(min_length=1,max_length=8000)
         mode:Literal['real','deterministic']='real'
         request_id:str|None=Field(default=None,min_length=1,max_length=200)
+        image_ids:list[str]=Field(default_factory=list,max_length=config.multimodal_max_chat_images)
+        allow_external_image_send:bool=Field(default=False,strict=True,
+            description='Explicitly allow this request’s uploaded images to be sent to the configured external VLM.')
     @app.post('/api/v1/chat')
     async def chat(body:Chat,a=Depends(actor)):
-        result=await agent.harness.invoke_chat(principal=a,conversation_id=body.conversation_id,message=body.message,mode=body.mode,client_request_id=body.request_id)
-        if result.get('error_code'): raise DomainError(result['error_code'],result['answer'])
+        result=await agent.harness.invoke_chat(principal=a,conversation_id=body.conversation_id,message=body.message,mode=body.mode,client_request_id=body.request_id,
+                                               image_ids=body.image_ids,allow_external_image_send=body.allow_external_image_send)
+        if result.get('error_code'):
+            error = DomainError(result['error_code'],result['answer'])
+            error.trace_id, error.invocation_id = result['trace_id'], result['invocation_id']
+            raise error
         return envelope(result)
     @app.post('/api/v1/chat/stream')
     async def stream(body:Chat,a=Depends(actor)):
         with db.tx() as c: b.owned(c,conversations,a,body.conversation_id)
-        return StreamingResponse(agent.harness.stream_chat(principal=a,conversation_id=body.conversation_id,message=body.message,mode=body.mode,client_request_id=body.request_id),media_type='text/event-stream')
+        return StreamingResponse(agent.harness.stream_chat(principal=a,conversation_id=body.conversation_id,message=body.message,mode=body.mode,client_request_id=body.request_id,
+                                                                         image_ids=body.image_ids,allow_external_image_send=body.allow_external_image_send),
+                                 media_type='text/event-stream')
     @app.get('/api/v1/workflows/{wid}')
     def workflow(wid:str,a=Depends(actor)): return envelope(b.workflow(a,wid))
     class Confirm(Input):

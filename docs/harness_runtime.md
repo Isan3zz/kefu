@@ -61,6 +61,8 @@ PolicyGuard 使用原 Skill Manager 可信白名单和严格工具参数 Schema�
 
 每次模型调用前重建上下文：系统规则、当前消息/可信 DB workflow、有效 Skill 正文及版本、带 chunk_id/version 的知识证据、近期消息、工具事实和摘要。模型 schema 加入后再次检查输入预算。默认窗口只是本机保护配置，实际部署需与供应商模型匹配。
 
+当前本机使用官方 `deepseek-flash` API，配置模型窗口为 1,048,576、单次输入预算为 400,000、单个 Agent invocation 累计预算为 1,600,000。三个配置项分别为 `MODEL_CONTEXT_WINDOW`、`CONTEXT_MAX_INPUT_TOKENS` 和 `MODEL_MAX_TOKEN_BUDGET`。本地检查使用保守的 UTF-8 字节估算，实际用量取供应商 usage。修改配置后重启 API 进程生效。 [DeepSeek 模型元数据](https://api-docs.deepseek.com/api/list-models/)
+
 采用保守 UTF-8 字节估算并保留输出/安全余量，标记 estimated，不能当作 tokenizer 精确计数或供应商费用。
 
 - L0：去掉重复/冗长工具正文，保留请求引用、业务 ID、状态、错误和必要事实；超长事实进一步缩为业务引用。原工具证据仍在 Trace。

@@ -84,8 +84,36 @@ class Settings(BaseSettings):
     memory_batch_worker_poll_seconds: float = Field(default=5, gt=0)
     memory_extraction_max_candidates_per_message: int = Field(default=3, ge=1, le=4)
     memory_extraction_max_candidates_per_batch: int = Field(default=12, ge=1, le=24)
+    multimodal_enabled: bool = True
+    multimodal_image_path: str = "data/images"
+    multimodal_max_image_bytes: PositiveInt = 10 * 1024 * 1024
+    multimodal_max_image_pixels: PositiveInt = 20_000_000
+    multimodal_upload_quota_bytes: PositiveInt = 100 * 1024 * 1024
+    multimodal_upload_quota_count: PositiveInt = 100
+    multimodal_upload_timeout_seconds: float = Field(default=20, gt=0)
+    multimodal_upload_ttl_seconds: PositiveInt = 86400
+    multimodal_max_chat_images: int = Field(default=4, ge=1, le=4)
+    chinese_clip_model_path: str = "models/chinese-clip"
+    chinese_clip_device: Literal['auto', 'cpu', 'cuda'] = "auto"
+    chinese_clip_batch_size: PositiveInt = 8
+    chinese_clip_local_only: bool = True
+    multimodal_chroma_images_collection: str = Field(default="mm_product_images_v1", pattern=r"^mm_product_images_[a-z0-9_]{1,40}$")
+    multimodal_chroma_text_collection: str = Field(default="mm_visual_texts_v1", pattern=r"^mm_visual_texts_[a-z0-9_]{1,40}$")
+    multimodal_image_weight: float = Field(default=.6, gt=0, lt=1)
+    multimodal_index_on_upload: bool = False
+    multimodal_external_vlm_images_enabled: bool = False
+    multimodal_image_send_max_bytes: PositiveInt = 5 * 1024 * 1024
+    multimodal_image_send_max_edge: PositiveInt = 1024
+    multimodal_image_token_estimate: PositiveInt = 1024
+    vlm_model: str = ""
+    vlm_provider_transport: Literal['data_uri', 'unsupported'] = 'data_uri'
+    vlm_supports_vision: bool = False
+    vlm_supports_tool_calling: bool = False
+
     @model_validator(mode='after')
     def context_capacity(self):
+        if not self.chinese_clip_local_only or self.multimodal_index_on_upload:
+            raise ValueError('Chinese-CLIP requires local files and user uploads must stay outside the catalog index')
         if self.context_max_input_tokens>self.model_context_window-self.context_reserved_output_tokens-self.context_safety_margin_tokens:
             raise ValueError('CONTEXT_MAX_INPUT_TOKENS exceeds context window after reserves')
         if self.model_max_output_tokens>self.context_reserved_output_tokens:

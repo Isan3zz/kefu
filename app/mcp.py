@@ -10,10 +10,10 @@ from fastmcp import FastMCP, Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.dependencies import get_http_headers
 from app.config import settings
-from app.business import Actor, Business, DomainError
+from app.business import Actor, Business, DomainError, PriceCents
 from app.db import DB, uid
 from app.observability import emit
-from pydantic import BaseModel,ConfigDict,model_validator
+from pydantic import BaseModel,ConfigDict,StrictBool,model_validator
 from typing import Any
 
 class ToolFailure(BaseModel):
@@ -34,7 +34,7 @@ class ToolResponse(BaseModel):
         if not self.ok and self.data is not None: raise ValueError('Failed tools must not expose business data')
         return self
 
-TOOL_SCHEMA_VERSION='v2'
+TOOL_SCHEMA_VERSION='v3'
 
 def decode_tool_result(result):
     if getattr(result,'is_error',False) or getattr(result,'isError',False): raise DomainError('TOOL_UPSTREAM_ERROR','工具服务未返回有效业务结果')
@@ -88,9 +88,18 @@ def create_mcp(business, secret, testing=False):
         """Track an owned order."""
         return execute('track_shipment',dict(order_id=order_id))
     @m.tool
-    def search_products(keyword:str='',limit:int=10)->ToolResponse:
-        """Search tenant products."""
-        return execute('search_products',dict(keyword=keyword,limit=limit))
+    def search_products(
+        keyword: str = '',
+        limit: int = 10,
+        min_price_cents: PriceCents | None = None,
+        max_price_cents: PriceCents | None = None,
+        in_stock_only: StrictBool = False,
+    ) -> ToolResponse:
+        """Search tenant products with optional inclusive price bounds and an in-stock filter."""
+        return execute('search_products', dict(
+            keyword=keyword, limit=limit, min_price_cents=min_price_cents,
+            max_price_cents=max_price_cents, in_stock_only=in_stock_only,
+        ))
     @m.tool
     def check_refund_eligibility(order_id:str)->ToolResponse:
         """Compute deterministic refund eligibility."""

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import html
 import json
+import re
 import subprocess
 import tempfile
 import time
@@ -20,6 +21,7 @@ from app.rag import RAG,atomic_json,model_manifest,CHUNKER_VERSION
 from app.observability import TraceRecorder, active_trace, evaluation_scope
 from app.dataset import load_dataset, FIXTURE_TIME, FIXTURE_VERSION
 from app.evidence import audit_tool_reads,audit_citations
+from app.harness.metrics import harness_metrics, rate
 from datetime import datetime
 from contextlib import contextmanager,ExitStack
 from typing import Protocol
@@ -153,6 +155,29 @@ def assertions(case,trace,final):
             results.append(EvalResult(case_id=case['case_id'],evaluator=metric,passed=value>0,score=value,failure_category=None if value>0 else 'RETRIEVAL_ERROR',reason='gold chunk comparison',evidence={'retrieved':ids,'gold':sorted(gold)}).model_dump())
     return results
 
+def response_assertions(case_id, step_number, step, response):
+    answer = response.get('answer', '')
+    plain_answer = re.sub(r'\*\*([^\n*]+)\*\*', r'\1', answer)
+    plain_answer = re.sub(r'(?<=[\u4e00-\u9fff])[：:][ \t]*(?=\d)', ' ', plain_answer)
+    required = step.get('answer_contains', [])
+    alternatives = step.get('answer_contains_any', [])
+    if required or alternatives:
+        missing = [fragment for fragment in required if fragment not in answer and fragment not in plain_answer]
+        unmatched_alternatives = alternatives if not any(fragment in answer or fragment in plain_answer for fragment in alternatives) else []
+        passed = not (missing or unmatched_alternatives)
+        yield EvalResult(case_id=case_id, evaluator='step_answer_contains', passed=passed,
+                         score=float(passed), failure_category=None if passed else 'GENERATION_ERROR',
+                         reason='matched' if passed else 'Required answer text missing',
+                         evidence={'step':step_number, 'missing':missing, 'unmatched_alternatives':unmatched_alternatives,
+                                   'answer':answer}).model_dump()
+    if step.get('citation_required'):
+        cited = [row['chunk_id'] for row in response.get('citations', []) if f"[{row['chunk_id']}]" in answer]
+        yield EvalResult(case_id=case_id, evaluator='step_citation_required', passed=bool(cited),
+                         score=float(bool(cited)), failure_category=None if cited else 'RETRIEVAL_ERROR',
+                         reason='matched' if cited else 'No retrieved citation in the answer',
+                         evidence={'step':step_number, 'cited_chunk_ids':cited}).model_dump()
+
+
 async def judge(answer,evidence,config=settings):
     if not answer: return {'status':'NOT_EVALUATED','score':None,'reason':'No generated answer in this case'}
     if not config.judge_enabled or not all((config.judge_api_key,config.judge_base_url,config.judge_model)):
@@ -210,6 +235,8 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
         report['knowledge_snapshot']=rag.active_manifest()
     for case in cases:
         start=time.perf_counter(); final={}; all_tools=[]; trace_ids=[]; error=None; evidence=[]
+        step_results=[]
+        review_turns=[] if 'e2e-100' in case.get('tags', []) else None
         citation_counts={'stale_knowledge_count':0,'invalid_citation_count':0,'unauthorized_citation_count':0}; forbidden_evidence_actions=0
         with evaluation_scope(report['run_id'],case['case_id']), case_workspace() as folder, ExitStack() as resources:
             root=Path(folder)
@@ -221,6 +248,12 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
                 seed_order_scenario(db,case['fixture'],clock)
             else:
                 db.seed(clock)
+                # The 100-case E2E suite needs the full simulated catalog.
+                # Do not change the fixtures used by existing evaluation cases.
+                if 'e2e-100' in case.get('tags', []):
+                    from app.product_fixtures import import_product_fixtures, merge_missing_static_attributes
+                    import_product_fixtures(db)
+                    merge_missing_static_attributes(db)
             from app.db import users
             principal_id=case.get('actor_user_id') or 'user_a'
             with db.tx() as connection:
@@ -243,7 +276,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             agent=Agent(b,gateway,cfg,rag); pending={}; response={}; workflow_id=None
             steps=case.get('steps') or [{'type':'chat','content':m['content']} for m in case.get('messages',[])]
             try:
-                for step in steps:
+                for step_number, step in enumerate(steps, 1):
                     typ=step['type']
                     if typ=='chat':
                         response=await agent.chat(a,conv,step['content'],'real' if mode=='agent-real' else 'deterministic',skill_mode)
@@ -276,6 +309,19 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
                             await agent.harness._invoke(a,conv,'conv:'+conv,{'kind':'adversarial_model_proposal'},None,None,'deterministic',None,False,propose)
                         except DomainError as e: final['error_code']=e.code
                     else: raise ValueError('Unknown step '+typ)
+                    if review_turns is not None and typ in ('chat','confirm'):
+                        observed = result if typ=='confirm' else response
+                        confirmation = observed.get('pending_confirmation') or {}
+                        review_turns.append({
+                            'step':step_number,
+                            'type':typ,
+                            'trace_id':observed.get('trace_id'),
+                            'answer':observed['answer'],
+                            'citations':observed.get('citations', []),
+                            'pending_confirmation':{key:confirmation[key] for key in ('order_id','amount_cents','status') if key in confirmation},
+                        })
+                    if response.get('error_code')!='UNKNOWN_OUTCOME':
+                        step_results.extend(response_assertions(case['case_id'], step_number, step, response))
                 if mode=='rag-real' or case['category']=='retrieval':
                     recorder=TraceRecorder(b,a,conv,cfg,operation='retrieval_evaluation',model_id='FakeModels' if mode=='deterministic' else 'local-bge')
                     retrieval_start=time.perf_counter()
@@ -325,14 +371,17 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             final['final_business_status']=added_refunds[-1]['status'] if added_refunds else None
             final['duplicate_refund_count']=sum(max(0,n-1) for n in Counter(r['order_id'] for r in refunds).values())
             # Copy evidence out of the isolated fixture before cleanup.
-            results=assertions(case,{'tool_events':all_tools},final)
+            results=assertions(case,{'tool_events':all_tools},final)+step_results
             if error and not (final.get('error_code')==case['expected'].get('error_code') and final.get('error_code')):
                 unknown=final['execution_outcome']=='UNKNOWN_OUTCOME'
                 results.append(EvalResult(case_id=case['case_id'],evaluator='execution',passed=None if unknown else False,failure_category=None if unknown else 'SYSTEM_ERROR',reason='UNKNOWN_OUTCOME: not a failed or successful refund verdict' if unknown else str(error),evidence=error).model_dump())
             if not results: raise ValueError('No applicable assertions for '+case['case_id'])
             verdict=await judge(response.get('answer',''),{'citations':response.get('citations',[]),'tools':all_tools,'business_final_state':final},config) if mode=='agent-real' else {'status':'NOT_EVALUATED','score':None,'reason':'Offline/RAG-only evaluation does not call a Judge'}
             case_passed=False if any(r['passed'] is False for r in results) else None if final['execution_outcome']=='UNKNOWN_OUTCOME' else True
-            report['cases'].append(dict(case_id=case['case_id'],passed=case_passed,evaluation_status='UNKNOWN_OUTCOME' if case_passed is None else 'EVALUATED',results=results,final_state=final,trace_ids=trace_ids,traces=trace_payloads,tools=all_tools,answer=response.get('answer',''),citations=response.get('citations',evidence),latency_ms=(time.perf_counter()-start)*1000,judge=verdict,original_case=case,tags=case.get('tags',[])))
+            call_counts=[trace['tool_calls'] for trace in trace_payloads if 'tool_calls' in trace]
+            report['cases'].append(dict(case_id=case['case_id'],passed=case_passed,evaluation_status='UNKNOWN_OUTCOME' if case_passed is None else 'EVALUATED',results=results,final_state=final,trace_ids=trace_ids,traces=trace_payloads,tools=all_tools,tool_call_count=sum(call_counts) if call_counts else None,answer=response.get('answer',''),citations=response.get('citations',evidence),latency_ms=(time.perf_counter()-start)*1000,judge=verdict,original_case=case,tags=case.get('tags',[])))
+            if review_turns is not None:
+                report['cases'][-1]['review_turns']=review_turns
             await agent.close()
     metrics={}
     for name in sorted({r['evaluator'] for c in report['cases'] for r in c['results']}):
@@ -367,8 +416,10 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
     llm_events=[e for c in report['cases'] for t in c['traces'] for e in t['events'] if e['type']=='llm']
     report['llm_usage'],report['llm_cost']=summarize_llm_usage(llm_events,config)
     report['skill_load_estimated_tokens']=sum(e.get('estimated_tokens',0) for c in report['cases'] for t in c['traces'] for e in t['events'] if e['type']=='skill_load')
-    from app.harness.metrics import harness_metrics
     report['harness']=harness_metrics(report)
+    task_call_counts=[c['tool_call_count'] for c in report['cases'] if c['tool_call_count'] is not None]
+    metrics['end_to_end_task_pass_rate']={**report['harness']['end_to_end_task_pass_rate'],'kind':'pass_rate'}
+    metrics['avg_tool_calls_per_task']=rate(sum(task_call_counts),len(task_call_counts),kind='mean_count')
     from app.harness.loop_metrics import loop_metrics
     report['loop']=loop_metrics(report['cases'])
     output=Path('data/eval_runs')/report['run_id']; output.mkdir(parents=True)

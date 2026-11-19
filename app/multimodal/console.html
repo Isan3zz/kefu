@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>商品图文检索</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #13283b;
+  --subtle: #41576b;
+  --canvas: #eef3f7;
+  --paper: #fcfeff;
+  --line: #aebecb;
+  --blue: #075c87;
+  --alert: #9a362c;
+  font: 16px/1.6 "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); background: var(--canvas); }
+main { max-width: 1120px; margin: auto; padding: clamp(20px, 5vw, 64px); }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { margin: 0 0 18px; font-size: clamp(1.9rem, 4vw, 3.4rem); line-height: 1.2; letter-spacing: -.05em; }
+h2 { font-size: 1.1rem; margin: 0 0 12px; }
+a { color: var(--blue); }
+section { background: var(--paper); border: 1px solid var(--line); padding: 20px; }
+.session { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+.session label { flex: 1 1 220px; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; margin: 16px 0; }
+label { display: grid; gap: 4px; font-weight: 600; }
+input, select, textarea, button { font: inherit; }
+input:not([type=checkbox]), select, textarea {
+  min-width: 0; width: 100%; padding: 8px 10px; color: inherit; background: white; border: 1px solid var(--line);
+}
+button { background: var(--blue); color: white; border: 1px solid var(--blue); padding: 8px 14px; min-height: 42px; cursor: pointer; }
+button.secondary { background: white; color: var(--blue); }
+button:disabled { opacity: .55; cursor: wait; }
+:focus-visible { outline: 3px solid #bf562b; outline-offset: 3px; }
+.preview {
+  min-height: 220px; display: grid; place-items: center; gap: 10px; margin-bottom: 14px; padding: 14px; text-align: center;
+  border: 1px solid var(--blue); color: var(--subtle);
+  background: repeating-linear-gradient(0deg, transparent 0 23px, #dceaf2 23px 24px), var(--canvas);
+}
+.preview img { width: 100%; max-height: 270px; object-fit: contain; }
+.preview img[hidden] { display: none; }
+.controls { display: grid; gap: 12px; align-content: start; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.consent { display: flex; gap: 8px; align-items: baseline; font-weight: 400; color: var(--alert); }
+code, pre { font-family: Consolas, monospace; }
+#image-id { display: block; overflow-wrap: anywhere; padding-top: 8px; }
+#status { min-height: 1.6em; margin: 10px 0; }
+.cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); }
+article { display: grid; gap: 6px; margin-bottom: 10px; padding: 12px; border: 1px solid var(--line); }
+article img { width: 100%; height: 145px; object-fit: contain; background: var(--canvas); }
+pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: 0; }
+@media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+<header><h1>商品图文检索</h1><a href="/docs">OpenAPI 接口</a></header>
+<section class="session" aria-label="鉴权">
+  <label>Bearer Token<input id="token" type="password" autocomplete="off"></label>
+  <button class="secondary" id="login" type="button">登录演示账号</button>
+</section>
+<div class="layout">
+<section>
+  <h2>查询图片</h2>
+  <div class="preview"><img id="preview" alt="待检索图片预览" hidden><span id="placeholder">选择 JPEG、PNG 或 WebP</span></div>
+  <label>图片文件<input id="file" type="file" accept="image/jpeg,image/png,image/webp"></label>
+  <code id="image-id"></code>
+</section>
+<section class="controls">
+  <label>检索方式<select id="mode">
+    <option value="by-image">图搜商品</option>
+    <option value="by-text">文搜商品图</option>
+    <option value="text-by-image">图搜短文本</option>
+    <option value="by-image-and-text">图文联合检索</option>
+  </select></label>
+  <label>查询文字<textarea id="query" rows="3" maxlength="300" placeholder="描述商品外观，或询问图片中的商品"></textarea></label>
+  <label>价格上限（元）<input id="price" type="number" min="0" max="999999" step=".01"></label>
+  <label class="consent"><input id="consent" type="checkbox">允许本次聊天将所选图片发送给配置的外部模型供应商</label>
+  <div class="actions">
+    <button id="search" type="button">检索</button>
+    <button class="secondary" id="chat" type="button">发送给客服</button>
+    <button class="secondary" id="delete" type="button">删除已上传图片</button>
+  </div>
+</section>
+</div>
+<section aria-label="结果">
+  <h2>结果</h2>
+  <p id="status" role="status">等待查询</p>
+  <div id="cards" class="cards"></div>
+  <details><summary>响应数据与 Trace ID</summary><pre id="details"></pre></details>
+</section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const buttons = Array.from(document.querySelectorAll('button'));
+let image = null;
+let uploadedFile = null;
+let conversation = null;
+let previewUrl = null;
+const resultUrls = [];
+
+function headers() {
+  const token = el('token').value.trim();
+  if (!token) throw new Error('请登录或填写 Bearer Token。');
+  return {'Authorization': 'Bearer ' + token};
+}
+async function request(path, {method = 'GET', body, publicRoute = false} = {}) {
+  const config = {method, headers: publicRoute ? {} : headers()};
+  if (body instanceof FormData) config.body = body;
+  else if (body !== undefined) {
+    config.headers['Content-Type'] = 'application/json';
+    config.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, config);
+  const payload = await response.json();
+  if (!response.ok) {
+    el('details').textContent = JSON.stringify(payload.error, null, 2);
+    throw new Error((payload.error?.message || '请求失败') + '（' + payload.code + '）');
+  }
+  return {data: payload.data, trace: response.headers.get('X-Trace-ID')};
+}
+function showPreview() {
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  const file = el('file').files[0];
+  previewUrl = file ? URL.createObjectURL(file) : null;
+  el('preview').hidden = !previewUrl;
+  if (previewUrl) el('preview').src = previewUrl;
+  el('placeholder').hidden = Boolean(previewUrl);
+}
+el('file').addEventListener('change', showPreview);
+el('token').addEventListener('input', () => {
+  image = uploadedFile = conversation = null;
+  el('image-id').textContent = '';
+  clearResults();
+});
+async function ensureImage() {
+  const file = el('file').files[0];
+  if (!file) throw new Error('请先选择图片。');
+  if (image && file === uploadedFile) return image.image_id;
+  const form = new FormData();
+  form.append('file', file);
+  el('status').textContent = '正在上传图片…';
+  image = (await request('/api/v1/images', {method: 'POST', body: form})).data;
+  uploadedFile = file;
+  el('image-id').textContent = image.image_id;
+  return image.image_id;
+}
+function clearResults() {
+  for (const url of resultUrls.splice(0)) URL.revokeObjectURL(url);
+  el('cards').replaceChildren();
+  el('details').textContent = '';
+}
+async function show(result) {
+  const {data, trace} = result;
+  const items = data.items || data.cards || [];
+  el('status').textContent = data.answer || (items.length ? '返回 ' + items.length + ' 条候选' : '当前没有匹配的候选。');
+  el('details').textContent = JSON.stringify({...data, trace_id: data.trace_id || trace}, null, 2);
+  for (const item of items) {
+    const card = document.createElement('article');
+    const name = document.createElement('strong');
+    name.textContent = item.product_name || item.content;
+    card.append(name);
+    if (Number.isInteger(item.price_cents)) {
+      const price = document.createElement('span');
+      price.textContent = '¥' + (item.price_cents / 100).toFixed(2);
+      card.append(price);
+    }
+    el('cards').append(card);
+    if (typeof item.image_url === 'string' && /^\/api\/v1\/images\/[0-9a-f-]{36}$/.test(item.image_url)) {
+      const response = await fetch(item.image_url, {headers: headers()});
+      if (response.ok) {
+        const img = document.createElement('img');
+        const url = URL.createObjectURL(await response.blob());
+        resultUrls.push(url);
+        img.src = url;
+        img.alt = item.product_name;
+        card.prepend(img);
+      }
+    }
+  }
+}
+function action(id, operation) {
+  el(id).addEventListener('click', async () => {
+    buttons.forEach(button => { button.disabled = true; });
+    clearResults();
+    el('status').textContent = '正在处理…';
+    try {
+      await operation();
+    } catch (error) {
+      el('status').textContent = error.message;
+    } finally {
+      buttons.forEach(button => { button.disabled = false; });
+    }
+  });
+}
+action('login', async () => {
+  const {data} = await request('/api/v1/auth/demo-login',
+    {method: 'POST', body: {demo_user_key: 'user_a'}, publicRoute: true});
+  el('token').value = data.token;
+  el('token').dispatchEvent(new Event('input'));
+  el('status').textContent = '已登录演示账号。';
+});
+action('search', async () => {
+  const mode = el('mode').value;
+  const body = {};
+  if (mode === 'by-text' || mode === 'by-image-and-text') {
+    body.query = el('query').value.trim();
+    if (!body.query) throw new Error('请输入查询文字。');
+    if (el('price').value !== '') {
+      if (!el('price').checkValidity()) throw new Error('请输入有效的价格上限。');
+      body.filters = {max_price_cents: Math.round(Number(el('price').value) * 100)};
+    }
+  }
+  if (mode !== 'by-text') body.image_id = await ensureImage();
+  await show(await request('/api/v1/multimodal/search/' + mode, {method: 'POST', body}));
+});
+action('chat', async () => {
+  const consent = el('consent').checked;
+  el('consent').checked = false;
+  const message = el('query').value.trim();
+  if (!message) throw new Error('请输入要发送给客服的文字。');
+  const image_ids = el('file').files.length ? [await ensureImage()] : [];
+  if (consent && !image_ids.length) throw new Error('请先选择要授权外发的图片。');
+  if (!conversation) conversation = (await request('/api/v1/conversations', {method: 'POST'})).data.id;
+  await show(await request('/api/v1/chat', {method: 'POST', body: {
+    conversation_id: conversation, message, image_ids, allow_external_image_send: consent
+  }}));
+});
+action('delete', async () => {
+  if (!image) throw new Error('当前没有已上传的图片。');
+  await request(image.url, {method: 'DELETE'});
+  image = uploadedFile = null;
+  el('image-id').textContent = '';
+  el('file').value = '';
+  showPreview();
+  el('status').textContent = '已删除图片。';
+});
+</script>
+</body>
+</html>

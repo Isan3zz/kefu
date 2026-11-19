@@ -159,7 +159,8 @@ async def test_L07_L08_L10_load_only_requested_skill_and_cannot_grant_authority(
     assert '恶意指令' not in requests[0]['messages'][0]['content']
     activation,=[row for row in trace['events'] if row['type']=='loop.skill_activated']
     from app.db import digest
-    assert activation['hash']==digest(file.read_text(encoding='utf-8')) and activation['version']=='1.0.0'
+    assert activation['hash']==digest(file.read_text(encoding='utf-8'))
+    assert activation['version']==env['agent'].skills.catalog['refund-processing']['version']
     assert result['terminal_reason']=='ERROR' and count(env,refund_requests)==0
 
 
@@ -211,6 +212,84 @@ async def test_L18_steps_and_tool_limit(env,loop_chat,monkeypatch):
     assert json.loads(messages[-1].content)['error_code']=='STEP_LIMIT_EXCEEDED'
 
 
+@pytest.mark.parametrize(('text','order_id'),[
+    ('请为 O1001 发起退款申请','O1001'),
+    ('我要申请订单 O1003 的退款。','O1003'),
+])
+async def test_agent_refund_decision_starts_preview_only(env,loop_chat,text,order_id):
+    result,_,_,_=await loop_chat(text,[[call('begin_refund_workflow',{'order_id':order_id})]])
+    assert result['terminal_reason']=='PENDING_APPROVAL'
+    assert result['pending_confirmation']['order_id']==order_id
+    assert count(env,workflow_instances)==1
+    assert count(env,refund_requests)==0
+
+
+async def test_agent_composes_refund_eligibility_with_each_verified_order(env,loop_chat):
+    def compose(body):
+        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
+        assert 'O1001 可申请退款' in facts['B1']['preview']
+        assert 'O1004 暂不能自动退款（EXPIRED）' in facts['B2']['preview']
+        return '为您整理如下：{{B2}}；另外，{{B1}}。'
+
+    decisions = [[call('check_refund_eligibility',{'order_id':'O1001'},'eligible'),
+                  call('check_refund_eligibility',{'order_id':'O1004'},'expired')], compose]
+    result,_,trace,_=await loop_chat('对比 O1001 和 O1004 的退款资格，先别申请。',decisions)
+    assert 'O1004 暂不能自动退款（EXPIRED）' in result['answer']
+    assert 'O1001 可申请退款' in result['answer']
+    assert next(event['mode'] for event in trace['events'] if event['type']=='loop.reply_composed')=='MODEL_TEMPLATE'
+    assert count(env,workflow_instances)==count(env,refund_requests)==0
+
+
+async def test_agent_product_tool_exposes_and_applies_generic_filters(env,loop_chat):
+    from app.product_fixtures import import_product_fixtures
+    import_product_fixtures(env['db'])
+
+    filters = {'min_price_cents':15000, 'max_price_cents':20000, 'in_stock_only':True}
+
+    def choose_tool(body):
+        schema = next(tool['function']['parameters'] for tool in body['tools']
+                      if tool['function']['name']=='search_products')
+        assert set(schema['properties'])=={'keyword','limit',*filters}
+        assert not schema.get('required')
+        return [call('search_products',filters)]
+
+    draft='150 到 200 元之间有两款现货：Lite 真无线耳机 159 元，Pocket 便携蓝牙音箱 179 元。'
+    result,_,_,_=await loop_chat('150 到 200 元之间有哪些现货？',[choose_tool,draft])
+    action,=result['tool_actions']
+    assert all(action['args'][key]==value for key,value in filters.items())
+    assert [row['id'] for row in action['result']['data']]==['yt-lite-tws','yt-pocket-speaker']
+    assert result['answer']==draft
+
+
+async def test_catalog_answer_uses_model_text_and_full_attributes_after_retry(env,loop_chat):
+    from app.product_fixtures import import_product_fixtures
+    import_product_fixtures(env['db'])
+    answer='云听 Travel 售价 549 元，目前库存 13 件，标称续航 55 小时。'
+
+    def compose(body):
+        task = json.loads(body['messages'][1]['content'])['current_task']
+        assert 'reply_facts' not in task
+        travel, = task['product_results']
+        assert travel['id']=='yt-travel-anc'
+        assert travel['attributes']['battery_hours']==55
+        assert '直接用自然中文回答 current_task.message' in body['messages'][0]['content']
+        return answer
+
+    decisions = [[call('search_products',{'keyword':'Travel 耳机'},'miss')],
+                 [call('search_products',{'keyword':'Travel'},'hit')], compose]
+    result,_,trace,_=await loop_chat('Travel 现价、库存和续航怎么样？',decisions)
+    assert result['answer']==answer
+    assert next(event['mode'] for event in trace['events'] if event['type']=='loop.reply_composed')=='MODEL_DIRECT'
+
+
+async def test_catalog_answer_rejects_unverified_citation_without_catalog_dump(env,loop_chat):
+    invented='a'*24
+    result,_,trace,_=await loop_chat('查一下云听耳机',[[call('search_products')],f'根据说明书 [{invented}]。'])
+    assert invented not in result['answer']
+    assert '未能给出可核实的商品答复' in result['answer']
+    assert next(event['mode'] for event in trace['events'] if event['type']=='loop.reply_composed')=='PRODUCT_REPLY_FALLBACK'
+
+
 async def test_L19_repeat_does_not_dispatch_twice(loop_chat):
     result,requests,trace,_=await loop_chat('列订单',[[call('get_orders')],[call('get_orders',ident='call_repeat')]])
     assert len(requests)==2 and result['terminal_reason']=='LIMIT' and result['tool_call_count']==1
@@ -243,8 +322,9 @@ async def test_L22_L23_memory_cross_session_without_per_turn_extraction(env,loop
     memory.update_settings(env['a'],auto_write_enabled=True)
     await memory.create_memory(principal=env['a'],data=MemoryInput(memory_type='preference',subject_key='headphones.noise',content='耳机优先降噪'))
     second=env['b'].conversation(env['a'])['id']
-    result,requests,trace,_=await loop_chat('推荐一款耳机',[[call('search_products')],'看看耳机选项。'],conversation=second)
-    assert '降噪' in result['answer'] and '实时商品信息' in result['answer']
+    answer='云听耳机售价 299 元、库存 20 件，但它不支持主动降噪。'
+    result,requests,trace,_=await loop_chat('推荐一款耳机',[[call('search_products')],answer],conversation=second)
+    assert result['answer']==answer
     assert not any(item['function']['name'].startswith('memory') for item in requests[0]['tools'])
     assert any(row['type']=='memory.trigger_checked' for row in trace['events'])
     from app.db import memory_jobs, memory_pending

@@ -20,6 +20,13 @@ async def test_H24_evaluation_works_with_no_optional_telemetry_service(env,monke
     assert report['passed']==report['total']==10
     assert report['harness']['invocation_success_rate']['denominator']>0
     assert report['harness']['unknown_outcome_count']==0
+    repeat=next(case for case in report['cases'] if case['case_id']=='refund-repeat')
+    confirm_traces=[trace for trace in repeat['traces'] if any(
+        event['type']=='invocation.started' and event.get('operation')=='confirm'
+        for event in trace['events']
+    )]
+    assert sorted(trace['tool_calls'] for trace in confirm_traces)==[0,1]
+    assert repeat['tool_call_count']==sum(trace['tool_calls'] for trace in repeat['traces'])
 
 async def test_H25_unknown_write_is_unresolved_not_a_failed_refund_verdict(env,tmp_path,monkeypatch):
     import json

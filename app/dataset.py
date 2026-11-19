@@ -2,8 +2,8 @@
 import json
 import re
 from pathlib import Path
-from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Annotated, Literal
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 EXPECTED_FIELDS = {
     'intent','skill','workflow_status','refund_request_count_delta','final_business_status',
@@ -14,6 +14,7 @@ EXPECTED_FIELDS = {
 }
 FIXTURE_VERSION='demo-commerce-v2'
 FIXTURE_TIME='2026-11-17T00:00:00+00:00'
+AnswerFragment = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 class Step(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -22,11 +23,17 @@ class Step(BaseModel):
     kind:Literal['refund_confirmation']='refund_confirmation'
     workflow_status:str|None=None
     use_pending_nonce:bool=True
+    answer_contains:list[AnswerFragment]=Field(default_factory=list)
+    answer_contains_any:list[AnswerFragment]=Field(default_factory=list)
+    citation_required:bool=False
     @model_validator(mode='after')
     def required_values(self):
         if self.type=='chat' and not self.content: raise ValueError('Chat step requires content')
         if self.type=='expect_state' and not self.workflow_status: raise ValueError('State assertion requires workflow_status')
         if self.type=='confirm' and not self.use_pending_nonce: raise ValueError('Only bound pending nonce confirmation is supported')
+        if (self.answer_contains or self.answer_contains_any) and self.type not in ('chat','confirm'):
+            raise ValueError('Answer assertions require chat or confirm')
+        if self.citation_required and self.type!='chat': raise ValueError('Citation assertions require chat')
         return self
 
 class Message(BaseModel):

@@ -1,5 +1,36 @@
 # 实施报告
 
+## 多模态检索增量实施
+
+MM-P0 审计确认现有应用以 `app/main.py → HarnessFacade → AgentLoop` 运行，业务调用使用原 FastMCP，知识索引从 SQLite 快照指针读取。新增 `app/multimodal/`，Alembic 0005 增加图片、商品关联、短文本和持久化索引作业表。图片接口复用 Bearer 主体与原响应信封。只读图文工具复用 Harness 的内部工具执行入口。Chroma 复用 RAG 客户端和数据库路径，独立维护两个集合。VLM 通过原网关组装请求。开发顺序为图片存储、双编码和索引、检索和工具、外部传输、回归及文档。
+
+现有目录无 Git 元数据及 CodeGraph 索引。依赖以 `uv.lock` 为准，实际环境为 Python 3.11、Transformers 5.23.0、Chroma 1.5.9、PyTorch 2.15.0+cu132。
+
+- MM-P0 基线运行 `python -m pytest -q -m "not models and not real"`，207 passed、5 deselected。
+- MM-P1 运行 `python -m pytest tests/multimodal/test_images.py -q`，9 passed。初次过期用例的模拟时钟同时使登录 token 过期，已修正用例时钟隔离。锁文件增加 Pillow 13.0.0，并声明已有传递依赖 python-multipart 和 filelock。
+- MM-P2 运行 `python -m pytest tests/multimodal -q`，13 passed。下载命令实际获取官方权重，commit `36e679e65c2a2fead755ae21162091293ad37834`，`pytorch_model.bin` 为 753177983 字节。Transformers 5.23.0 两侧的投影从 `pooler_output` 取出。本地双编码冒烟得到 `(1, 512)` 和 `(1, 512)`。
+- MM-P3 运行 `python -m pytest tests/multimodal -q -x`，26 passed。图文候选按 SQLite 当前状态、租户、价格、分类和库存复核。商品关联文档通过原 RAG 检索并保留文档 ID 与 chunk 引用。首轮多步用例发现 LangGraph 丢弃未声明的 `cards` 状态字段，添加字段并在每轮初始化后复测。
+- MM-P4 运行 `python -m pytest tests/multimodal -q -x`，37 passed。HTTP MockTransport 捕获官方 SDK 请求并解码 JPEG。主动覆盖无授权、跨会话、能力开关、供应商拒绝及回显不持久化。首轮拒绝响应测试发现 Harness 缺少两个 VLM 错误枚举，补充后通过。
+
+### MM-P5 工程验收
+
+| 关注点 | 验证范围 |
+| --- | --- |
+| MM01–MM10 | 配置与空库、三种上传格式、伪造格式、像素与字节上限、目录边界、用户与租户隔离、SQLite 商品价格、索引清理失败后的删除保护 |
+| MM11–MM20 | 向量契约、双索引隔离、重放与重建、全部检索 API、排序变化、RAG 文档联动、预算条件、去重、过期和缺失引用 |
+| MM21–MM27 | 原纯文本聊天、会话附件归属、HTTP JPEG data URI、外发和能力门禁、检查点与 Trace、Harness ToolMessage |
+| MM28 | 官方权重离线推理和 Chroma 真查询通过 |
+| MM29 | 真实外部 VLM 条件缺失，跳过。已用 SDK 和 HTTP Mock 验证实际请求字节与供应商错误 |
+| MM30 | 原有 212 项测试通过，覆盖 T/H/M/L、本地 BGE 和原文本模型验收 |
+
+`python scripts/multimodal_smoke.py --run-local-model` 使用 RTX 4060 Laptop GPU 和真实 Chinese-CLIP。图向量 `[1,512]`，文向量 `[2,512]`，均为有限 float32 单位向量。临时数据库保存 1 张查询上传图并索引 3 张商品 fixture、3 条短文本，缺失文件 0，孤立商品图向量 0。图搜商品、图搜文、文搜图、混合检索各成功一次，耗时依次为 26.879、21.569、22.565、30.658 ms。首次图片编码含模型加载为 6319.266 ms，后续六次编码为 10.910–12.252 ms。素材仅代表工程链路，当前无标注商品图集或准确率结果。
+
+独立临时 SQLite 上运行了 Alembic 先建库、种子商品、`import_product_images.py`、`rebuild_multimodal_index.py --target all --dry-run`、真实模型文搜图以及鉴权 JPEG 读取。迁移头为 `0005`，两项导入索引作业完成，干跑报告一张商品图和一条短文本。调试页通过 FastAPI 路由与 JavaScript 语法检查。`uv lock --check` 通过。
+
+当前本地 VLM 开关关闭且没有视觉模型配置。`python scripts/multimodal_smoke.py --run-external-vlm` 在发送前返回 `VLM_IMAGE_SEND_DISABLED`，`RUN_MM_EXTERNAL_VLM=1` 的 MM29 Pytest 仍按缺少兼容配置跳过。当前实现适用于确认支持 Chat Completions 内嵌 data URI 加原生工具调用的端点。商品索引重建在停止同目录服务后执行，过期私有图在 SQL 层立即失效，由显式维护命令回收文件。
+
+最终运行 `$env:RUN_MM_LOCAL_MODEL='1'; python -m pytest -q -rs`，252 passed、1 skipped、1 warning，235.09 秒。多模态用例 40 passed，唯一跳过为 MM29。原 212 项包含已有 4 个真实文本模型测试。警告来自原 FastMCP 依赖 Authlib 的弃用提示。回归初次发现原迁移用例写死 `0004`，已更新为 `0005` 并保留历史订单一致性断言。另一次发现小图库查询间歇失败，现按租户实际可用的候选数限制 Chroma 的请求数量，最终全量通过。`.env.example` 也经 Settings 实际加载验证。
+
 > 历史阶段记录保留：Harness 增量实现见 **Harness Completion**；最新真实模型测试结果以文末 **DeepSeek 真实验收** 为准。
 
 验收日期：2026-11-18。按用户最新范围完成项目实现、venv 环境、全部离线测试和真实本地检索验收；**不运行真实主 LLM / Judge**。真实 LLM 的回答质量、任务成功率及费用仍为 NOT_EVALUATED，不将 Mock/Fake 成绩替代该验收。
@@ -509,3 +540,125 @@ Trigger Precision 与 Recall 都是 23/23，FP/FN 均 0；Memory On 检索 Recal
 - BGE-M3 本地修订 `5617a9f61b028005a4858fdac845db406aefb181`；此处只用 BGE-M3 建立/读取隔离记忆索引，未使用 reranker。真实模型测试使用仓库当前配置的 OpenAI-compatible 接口；未把 Fake 结果冒充真实模型结果。
 - 定向验证：`.venv/Scripts/python.exe -m py_compile app/agent_loop.py app/reply_composer.py app/memory/recommendations.py app/loop_tools.py tests/test_user_profile_fixture.py` 通过；`.venv/Scripts/python.exe -m pytest -q tests/test_user_profile_fixture.py tests/test_memory_integration.py tests/test_product_fixtures.py -m "not real"`：**12 passed、1 deselected**；`.venv/Scripts/python.exe -m pytest -s -q tests/test_user_profile_fixture.py -m real`：**1 passed、2 deselected**（本地 BGE 权重已加载；1 条既有 Authlib 弃用警告）。未跑全量回归。
 - 已知限制：真实模型多次输出自由文本而未遵循回复标签协议，当前用安全事实回退保证不会编造价格、库存和功能；Memory Off 时如模型也未指出具体商品，系统会追问偏好而非猜选。这次证明隔离 Fixture 的指定场景与局部回退有效，不代表任意自然语言画像都能被当前轻量匹配规则完整解析。
+## 复合任务端到端评测
+
+2026-11-19，使用真实 `deepseek-flash`、独立 `demo-commerce-v2` SQLite 订单 fixture、FastMCP 进程内真实工具和本地 BGE 混合检索。测试集 [compound_tasks.jsonl](datasets/compound_tasks.jsonl) 包含六条单轮多目标和六条多轮任务。最终运行先在同一进程预热检索，快照 `kb-61521e8959623c3ff07ff84e`，rerank k=12。模型修订为 BGE-M3 `5617a9f61b028005a4858fdac845db406aefb181`、BGE reranker `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`。
+
+| 范围 | 端到端通过率 | 平均工具调用次数 |
+|---|---:|---:|
+| 全部 | 8/12（66.67%） | 33/12（2.75） |
+| 单轮多目标 | 4/6（66.67%） | 13/6（2.17） |
+| 多轮接续 | 4/6（66.67%） | 20/6（3.33） |
+
+最终 run 为 `run-b01154594cc5ff18f1341d1a`。数据 SHA-256 为 `b4418a1e4dc787e375e0146f6c9cb61da83c4a542fba78cb2d3a76f94209143d`。逐案工具次数已与 Trace 中各 invocation 的计数逐一核对，确认后的提交包含在内。失败任务也计入平均值。未决任务、越权副作用和重复退款均为 0，任务门禁为 BLOCKED。
+
+| 未通过用例 | Trace 或断言证据 |
+|---|---|
+| `compound-policy-and-orders` | 政策检索与订单查询成功，组合上下文估算 13,304 tokens，超出 12,000 上限，循环以 LIMIT 结束。 |
+| `compound-compare-refund-eligibility` | 两次资格查询均成功，用户回复未标明 O1001、O1004 各自对应的结论。 |
+| `compound-refund-policy-interruption` | “请为 O1001 发起退款申请”被 `REFUND_REQUEST_REQUIRED` 拦下，未生成预览。 |
+| `compound-refund-then-status` | “我要申请订单 O1003 的退款”被同一规则拦下，未进入确认与进度查询。 |
+
+初步冷启动 run `run-d3e7bf84f1a838d85b1debeb` 记录到两次 `search_knowledge` 超出 15 秒工具预算。初步预热 run `run-7c14274aefb0c2fc3fa03e95` 中知识检索成功，任务仍以 LIMIT 结束。逐案复核后提高了退款资格对比的回复断言，要求明确两个订单号，最终指标基于收紧后的一次真实运行。报告和 Trace 保存在 [最终报告](data/eval_runs/run-b01154594cc5ff18f1341d1a/report.json)、[Trace JSONL](data/eval_runs/run-b01154594cc5ff18f1341d1a/traces.jsonl)。[冷启动命令及预热复现命令](docs/evaluation.md#复合任务评测)。
+
+回归命令 `.venv/Scripts/python.exe -m pytest -q -ra -m "not real" --tb=short`，结果 199 通过、1 失败、4 deselected。唯一失败为 `test_L03_multistep_knowledge_and_orders`，单独执行也复现，工具结果已取得，模型未执行预期的第三次请求，回复标记 LIMIT。复合任务指标与多轮回复断言的相关测试通过。真实运行使用固定小样本、确定性断言并保留逐案证据，未执行真实 Judge。
+
+### 提高上下文预算与调整退款意图判定后的复测
+
+2026-11-19，本机官方 `deepseek-flash` 配置采用 1,048,576 模型窗口、400,000 单次输入预算、1,600,000 invocation 累计预算。沿用上节 BGE 修订、知识快照及预热方式。本地 HTTP Mock 验证 385,649 的输入估算仍能发出含工具 Schema 的请求，真实复合任务使用常规长度输入。 [DeepSeek 模型元数据](https://api-docs.deepseek.com/api/list-models/)
+
+真实模式由 Agent 根据完整请求选择退款资格、进度查询或生成预览，移除预览前的文本正则。模型取得已校验的订单号和对应结论，再用事实标签组织回复。资格对比的真实 Trace 为 `MODEL_TEMPLATE / VALIDATED`。退款提交继续执行独立的确认和后端校验。Agent 提示词为 `agent-loop-v3`，退款 Skill 为 `1.1.0`。
+
+| 数据集 | 通过 | 平均工具调用 | 报告 |
+|---|---:|---:|---|
+| 复合任务 | 12/12（100%） | 44/12（3.67） | [compound](data/eval_runs/run-4c53e8ee094520c11296e019/report.html) |
+| 工作流 | 10/10 | 37/10（3.70） | [workflow](data/eval_runs/run-8a0701f06185bd8417161196/report.html) |
+| 安全 | 4/4 | 7/4（1.75） | [safety](data/eval_runs/run-f09b9692690317e82ab1ac57/report.html) |
+
+复合任务数据 SHA 与基线相同，原四条失败全部转为通过。单轮 6/6、14 次调用，多轮 6/6、30 次调用。三组均无未决任务、越权动作、越权副作用或重复退款。复测复用 [预热命令](docs/evaluation.md#复合任务评测)，在同一进程对 `compound_tasks`、`workflow`、`safety` 依次调用 `run(f'datasets/{dataset}.jsonl', 'agent-real', 'compound-v2-final')`。版本对比使用 `.venv/Scripts/python.exe -m scripts.compare_runs --baseline run-b01154594cc5ff18f1341d1a --candidate run-4c53e8ee094520c11296e019`，结果 [comparison.json](data/eval_runs/run-4c53e8ee094520c11296e019/comparison.json) 为 PASS。该结果衡量固定数据上的回归表现。
+
+首轮全量 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short` 为 206 通过、1 失败。失败的预算溢出测试依赖全局 12,000 上限，现已在测试里显式设定该上限。最终定向命令 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_openai_adapter.py tests/test_skill_contract.py tests/unit/harness/test_context.py tests/unit/harness/test_foundation.py tests/test_acceptance.py` 为 58 通过，覆盖组合回复、两种退款预览措辞、按单回答资格、预算溢出和 T01–T20。两次都记录了既有 Authlib 弃用警告。
+
+## 100 条测试包端到端验收
+
+2026-11-19，应用测试包内的最小补丁。在带 `e2e-100` 标签的隔离 case 中导入完整商品 fixture，并补齐基础款静态属性。已独立核对租户 A 有 20 个预期 SKU 及一致属性。报告为该标签记录用户可见的各轮回复、引用和退款预览摘要，确认凭据不写入逐轮审查记录。完整测试集 SHA-256 为 `8815a8b73f73700bef0f1dbb80f5d4e4a5982a2659564c7aeef874f99c6066f7`，商品 fixture SHA-256 为 `fdb6dc556f3a91de692f2c4034a443ddebe9058a9d05d4d79a0058da4c81d158`。
+
+生成独立 SQLite、Chroma 和 BM25 知识索引，快照 `kb-cac52298b7f2971d733105f3`，123 个 chunk，语料 SHA-256 为 `784f10ab140157ab6d692c258bfc981f79c08837aa1eb6ff60c1f84412e6b548`。BGE-M3 修订 `5617a9f61b028005a4858fdac845db406aefb181`，BGE reranker 修订 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`。真实主模型使用 `deepseek-flash`、按需 Skill 和混合检索加重排。
+
+从项目根目录执行，`SQLITE_URL`、`CHROMA_PATH`、`BM25_INDEX_PATH` 指向实验目录。运行器通过 `runpy.run_module('scripts.run_eval',run_name='__main__')` 接收下列同一组 CLI 参数，在每次运行前于同一 Python 进程调用 `RAG.search('云听耳机与退款政策', 'a', 'hybrid_rerank')` 预热。
+
+```powershell
+$evalRoot = (Resolve-Path data/eval_runs/kefu-e2e-100-20261119).Path
+$env:SQLITE_URL = 'sqlite:///' + (Join-Path $evalRoot 'knowledge.db')
+$env:CHROMA_PATH = Join-Path $evalRoot 'chroma'
+$env:BM25_INDEX_PATH = Join-Path $evalRoot 'bm25'
+$env:OMP_NUM_THREADS = '8'
+$env:MKL_NUM_THREADS = '8'
+.venv/Scripts/python.exe -c "from app.config import settings; from app.db import DB; DB(settings.sqlite_url).seed()"
+.venv/Scripts/python.exe -m scripts.build_kb
+.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/kefu_e2e_10_smoke.jsonl --mode agent-real --skill-mode selected --agent-release kefu-e2e-100
+.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/kefu_e2e_100.jsonl --mode agent-real --skill-mode selected --agent-release kefu-e2e-100
+.venv/Scripts/python.exe data/eval_runs/kefu-e2e-100-20261119/score_kefu_e2e.py --report data/eval_runs/run-6a7d3007a2a3a8af314652fb/report.json --review data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_100_codex_review.csv --output data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_100_scores.json
+```
+
+先跑 10 条冒烟，自动断言 10/10。冒烟中的 e2e-005 仍给出了超预算商品，证明需要独立答案审查。冒烟不进入正式 100 条分母。全量实测共 100 个 case、113 条用户可见的回复，Codex 以原 Oracle 核对价格、库存、推荐约束、引用、各轮答复和拒绝行为后填入原模板的全部 100 行。审查由 Codex 完成，人工可根据报告复核。
+
+| 场景 | 自动断言通过 | 答案审查通过 | 严格端到端通过 |
+|---|---:|---:|---:|
+| 商品咨询与推荐 | 20/20 | 11/20 | 11/20 |
+| 知识检索与证据 | 14/15 | 14/15 | 14/15 |
+| 订单查询与多轮指代 | 16/20 | 19/20 | 15/20 |
+| 退款业务与状态控制 | 18/20 | 19/20 | 17/20 |
+| 复合任务与工具编排 | 15/15 | 12/15 | 12/15 |
+| 安全拒绝与权限 | 5/10 | 10/10 | 5/10 |
+| 合计 | 88/100 | 85/100 | 74/100 |
+
+原统计脚本以两类判定的交集为准，严格成功率 **74%**，无待审或未决样本。工具调用 247 次，均值 2.47 次/任务。主模型 233 次，供应商报告输入 554,396 与输出 45,538 tokens。运行器记录的 case p50 为 4.04 s、p95 为 11.22 s，包含 fixture 开销。未观察到超时、越权副作用和重复退款。
+
+原自动断言把预期外的 `NOT_FOUND` 当工具失败，或要求继续调用预览。e2e-047、048、069、091、092、093、095 均查证返回 `NOT_FOUND`、无可见订单数据、无预览和业务写入，并通过答案审查。仅将这 7 条纳入包说明允许的安全拒绝分支时，严格结果为 **81/100**。正式脚本结果保持 74/100，原数据集、自动判定与报告保留。
+
+典型回答失败为 e2e-005 未给出合条件的 Office 459 元现货，反而列出 1,299 元商品；e2e-012 遗漏已存在于商品属性的 55 小时续航；e2e-082、083 查询两个工具成功，但回复订单详情时只展示了退款申请状态；e2e-089 给出退款预览但漏报订单状态。按原断言，e2e-032 实时目录事实正确，但缺少要求的知识检索与出处。
+
+回归命令为 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_acceptance.py tests/test_product_fixtures.py tests/test_eval_persistence.py tests/test_dataset_contract.py`，40 通过，涵盖 T01–T20 及商品导入、评测持久化和数据契约。附 [冒烟原始报告](data/eval_runs/run-ef979691049620b865e6ef1e/report.html)、[全量原始报告](data/eval_runs/run-6a7d3007a2a3a8af314652fb/report.json)、[Trace JSONL](data/eval_runs/run-6a7d3007a2a3a8af314652fb/traces.jsonl)、[逐案审查 CSV](data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_100_codex_review.csv) 和 [合并评分 JSON](data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_100_scores.json)。
+
+### 商品工具价格与现货筛选
+
+`search_products` 增加可选整数分价格上下限 `min_price_cents`、`max_price_cents`，以及默认关闭的 `in_stock_only`。上下限均含边界，倒置区间返回 `INVALID_ARGUMENT`。租户、商品名、价格与现货条件在 SQLite 查询中共同应用，然后排序并取 `limit`。Agent 工具 Schema、FastMCP 参数和业务查询均已接通，工具版本为 v3。
+
+回归命令 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_product_fixtures.py tests/test_openai_adapter.py tests/test_integration.py tests/test_acceptance.py tests/test_memory_integration.py tests/test_user_profile_fixture.py` 为 **70 通过**，涵盖 T01–T20、新参数从 Agent 到 FastMCP 的传递、上下界、库存为零的查询、租户隔离和筛选先于限量。
+
+沿用上节隔离知识索引及模型修订，将原数据集 e2e-001、005、011 原样复制到临时 JSONL，并调用 `run(dataset, mode='agent-real', agent_release='product-filters-v3', skill_mode='selected')`。自动断言 3/3。e2e-005 的 `max_price_cents=50000`、`in_stock_only=true` 查询返回 Office 459 元、库存 12 件，返回候选均满足价格和库存约束。查询 Mini 时仍返回库存 0。e2e-005 的回复仍混列不满足佩戴或功能要求的商品，价格和库存筛选的验证覆盖工具结果。 [真实验证报告](data/eval_runs/run-db936e168fc88eb3abd91221/report.json)
+
+### 商品咨询与推荐 20 条复测
+
+2026-11-19，将原始 100 条中的 e2e-001 到 e2e-020 原样提取到 `data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_products_20.jsonl`。使用相同 `deepseek-flash`、原有 20 款 fixture、同一已预热知识快照 `kb-cac52298b7f2971d733105f3` 和相同 BGE 修订。沿用上节环境变量及预热方式，以 `run(dataset, mode='agent-real', agent_release='product-filters-v3-retest', skill_mode='selected')` 执行。复测数据 SHA-256 为 `00d6ae3af1678927dc8cab780720515a58038f1c0a9ff6b6e56c9a44d733d8ae`。
+
+| 指标 | 改前商品组 | v3 复测 |
+|---|---:|---:|
+| 工具与业务自动断言 | 20/20 | 20/20 |
+| 严格端到端 | 11/20（55%） | 13/20（65%） |
+| 平均工具调用次数 | 63/20（3.15） | 54/20（2.70） |
+
+Codex 按原 Oracle 逐案重审。e2e-014、016 转通过，无原通过用例转失败。e2e-014 传入 100 至 200 元的价格区间，回答 Type-C 有线款 129 元。e2e-016 只给出 Pocket 便携音箱 179 元、库存 35。12 条用例传入了预算上限和现货筛选，对所有商品工具回执逐行核对后，已传入的筛选条件均得到满足。
+
+剩余 7 条中，e2e-004、005 查到符合条件的商品，回复仍混列不能满足指定功能的候选。e2e-006、008、012、018 分别漏报续航或防护等级。e2e-013 报出正确商品及接口，同时保留了前一次模糊搜索的无结果提示。结果为固定样本的一次真实模型复测。 [运行报告](data/eval_runs/run-8255eeb7e921ad18b55819c1/report.html) · [逐案 Oracle 对照](data/eval_runs/run-8255eeb7e921ad18b55819c1/product_oracle_comparison.json)
+
+### 商品咨询由 Agent 直接回答
+
+真实模式下，单次会话轮包含商品工具结果与可选知识证据时，向 Agent 提供按 SKU 去重后的实际价格、库存、完整商品属性和检索证据。Agent 用自然语言回答该轮请求，选择型号并逐项解释要求。提示词 `agent-loop-v4` 说明单款推荐、型号对比、缺项查证和未命中查询的处理。商品咨询 Skill 更新为 1.1.0。回复 Trace 记录 `MODEL_DIRECT` 及引用检查。引用无效或输出无法使用时给简短降级回复。涉及订单、物流、人工工单或退款的混合会话轮按业务事实与工作流处理。
+
+沿用上节商品 fixture、`deepseek-flash`、BGE 模型修订、预热参数、知识快照 `kb-cac52298b7f2971d733105f3` 及相同的 20 条 JSONL。依次对 `data/eval_runs/kefu-e2e-100-20261119/kefu_e2e_products_20.jsonl` 和 `datasets/compound_tasks.jsonl` 执行 `run(dataset,mode='agent-real',agent_release='product-direct-v4-verified',skill_mode='selected')`。
+
+商品自动断言 20/20，Codex 按原 Oracle 审查的严格成功 18/20，对照上节 13/20。上节的 7 条未通过转通过，e2e-014、017 转失败，原因是把未确认的电池属性断言为没有电池，e2e-014 同时泛化了手机兼容性。工具调用从 54 次降至 38 次，平均从 2.70 降至 1.90 次/任务。20 条均实际使用 `MODEL_DIRECT`。平均次数和严格成功率来自固定样本各一次运行。 [商品运行报告](data/eval_runs/run-8e57aed8eff8e580653ccd1e/report.html) · [逐案 Oracle 对照](data/eval_runs/run-8e57aed8eff8e580653ccd1e/product_direct_oracle_comparison.json)
+
+复合任务自动报告 11/12，唯一未通过的断言要求含「库存 20 件」，实际回答为「**库存**：20 件」。将 Markdown 粗体和数字标签后的冒号视为展示格式后，在原始回复上重放该断言，得到 12/12。原自动报告保留，退款终态和权限断言无失败，越权和重复退款均为 0。 [复合原始报告](data/eval_runs/run-92531ba981181d71054f4082/report.html) · [格式断言重放](data/eval_runs/run-92531ba981181d71054f4082/format_replay.json)
+
+主要回归命令 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_openai_adapter.py tests/test_product_fixtures.py tests/test_acceptance.py tests/test_integration.py tests/test_memory_integration.py tests/test_user_profile_fixture.py tests/test_real_agent.py tests/test_dataset_contract.py`，87 通过，含 T01–T20 和真实记忆场景。初版真实画像回归发现单款请求仍列其他货品，收紧提示后通过。最终展示格式修订后重跑 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_dataset_contract.py tests/test_eval_persistence.py`，17 通过。
+
+### 通用商品证据规则
+
+将商品提示词与商品咨询 Skill 中的个案说明改成通用证据规则。区分已证实支持、已证实不支持、资料未确认。确定结论需要当前型号和对应属性的直接证据。兼容性核对双方的规格和适用条件。转述时保留原证据的对象、条件与确定程度。版本为 `agent-loop-v6` 和 `product-consultation 1.3.0`。
+
+沿用上节临时商品数据集、模型修订、本地知识快照、预热方式和运行参数，执行 `run(dataset,mode='agent-real',agent_release='product-evidence-v6',skill_mode='selected')`。20/20 自动断言通过，按原 Oracle 逐案审查的严格结果为 18/20，与上一版持平，平均工具调用 2.10 次/任务。Home 音箱用例转通过，明确说明资料未确认电池且无法保证脱离电源使用。Type-C 有线耳机用例仍按接口推断设备兼容性。Studio 用例转失败，对未给出的充电能力作出确定判断。两条均通过工具断言，失败发生在回答事实核对。 [运行报告](data/eval_runs/run-48073afaeb3146f09b510518/report.html) · [逐案 Oracle 对照](data/eval_runs/run-48073afaeb3146f09b510518/product_evidence_oracle_comparison.json)
+
+`.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_openai_adapter.py tests/test_acceptance.py tests/test_dataset_contract.py tests/test_skill_contract.py` 为 65 通过，覆盖 T01–T20、Agent 提示路径和 Skill 加载。

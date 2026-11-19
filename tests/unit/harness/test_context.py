@@ -46,6 +46,7 @@ async def test_H22_context_overflow_is_explicit_without_semantic_invention(env):
     ctx,_=RunController(env['b'],env['cfg']).begin(env['a'],env['conv'],'conv:'+env['conv'],{})
     manager=ContextManager(env['b'],env['cfg'])
     with pytest.raises(HarnessFailure) as error:
-        await manager.build_context(ctx=ctx,task_state={'message':'必要的当前问题'*5000},recent_messages=[],budget=manager.budget())
+        budget=ContextBudget(model_context_window=16384,reserved_output_tokens=2048,safety_margin_tokens=1024,max_input_tokens=12000)
+        await manager.build_context(ctx=ctx,task_state={'message':'必要的当前问题'*5000},recent_messages=[],budget=budget)
     assert error.value.code=='CONTEXT_BUDGET_EXCEEDED'
     with env['db'].tx() as c: assert c.scalar(select(func.count()).select_from(context_summaries))==0

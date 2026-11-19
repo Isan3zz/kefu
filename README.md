@@ -26,7 +26,7 @@ python -m scripts.init_db
 
 ## 显式下载和校验本地模型
 
-唯一下载权重的入口如下；API、测试和索引构建不会自动下载。
+以下命令显式下载和校验 BGE 模型。API、测试和索引构建不会自动下载权重。
 
 ```powershell
 python -m scripts.download_models --all
@@ -185,4 +185,88 @@ python -m scripts.rebuild_memory_index --dry-run
 
 导入器可重复执行；相同文件跳过，目标已有不同内容时停止。静态属性同步只补齐数据库中与 Fixture 已有值不冲突的缺失键，不改价格、库存、租户 B 商品或订单；只应对本地开发 SQLite 执行。评测脚本另建隔离 SQLite、Chroma 和 BM25 索引，按 `user_a` / `user_b` 运行 52 条正例，并对 8 条无答案/权限负例做独立检索审查。不会把扩展负例伪造成非空 `gold_chunks`。当前 `RETRIEVAL_RERANK_K=12`；k=8、12、16 的对照和逐案变化见 [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md)。
 
-当前本地开发活动快照为 123 个 chunk（原知识与 50 篇 v3 合并），由本地 BGE-M3 构建。四模式检索指标、k=8/12/16 对比、模型修订及失败案例已记录在 [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md)；本地运行目录中的逐案 Trace 不纳入 Git。评测是合成数据的检索实验，不代表生产问答质量或服务级别。
+当前本地开发活动快照为 123 个 chunk（原知识与 50 篇 v3 合并），由本地 BGE-M3 构建。四模式实验结果位于 [基准实验](data/eval_runs/rag-v3-20261119T052417Z-0df36dba/experiment_summary.json)，k=12 复测位于 [rerank 调整实验](data/eval_runs/rag-v3-20261119T060308Z-870c490d/experiment_summary.json)，k=16 的逐案比较位于 [k=16 对照结果](data/eval_runs/rag-v3-20261119T060308Z-870c490d/rerank_k16_comparison.json)。评测是合成数据的检索实验，不代表生产问答质量或服务级别。
+
+## 商品图文检索
+
+访问 [本地图文检索工作台](http://127.0.0.1:8000/multimodal) 上传、预览、检索和删除图片，也可在 [Swagger](http://127.0.0.1:8000/docs) 调试。沿用现有 Bearer 登录和会话。空图库返回空列表，文字客服可正常启动。
+
+### 下载权重与导入商品图
+
+在项目根目录执行。图片导入及重建期间请停止使用同一个 Chroma 路径的 API 进程。
+
+```powershell
+python -m alembic upgrade head
+python scripts/download_chinese_clip.py
+python scripts/import_product_images.py --product-id headphones-a --file ./my-headphones.png --caption "黑色头戴式无线耳机"
+python scripts/rebuild_multimodal_index.py --target all --dry-run
+```
+
+`--file` 可重复，用于同一商品的多张图。商品 ID 必须已存在，导入工具从商品表读取租户。相同商品与相同规范化图片会复用已登记的图片 ID。通过 `--replace-id <image_id>` 替换旧图，或由所属租户管理员调用图片删除 API。知识库已构建时可加 `--doc-id warranty` 将短描述关联到可见知识文档，Agent 可以沿着候选商品继续用原 BGE RAG 检索并引用知识块。
+
+权重默认位于 `models/chinese-clip/`，下载脚本在该目录记录模型 commit，重复执行使用已锁定版本。切换权重时用 `--revision <commit> --local-dir <new-directory>` 下载，再设置 `CHINESE_CLIP_MODEL_PATH`，全量重建两个图文集合。显存不足时可设置 `CHINESE_CLIP_DEVICE=cpu`。
+
+```powershell
+python scripts/rebuild_multimodal_index.py --target all
+python scripts/rebuild_multimodal_index.py --target all --retry
+```
+
+导入先保存 SQLite 和文件，再执行索引作业。可用 `--queue-only` 延迟编码。失败或中断后的索引作业可通过 `--retry` 收敛。重建仅读取 SQLite 有效记录，处理范围限于 `mm_product_images_v1` 和 `mm_visual_texts_v1`。索引 manifest 位于 `CHROMA_PATH/multimodal_index_manifest.json`。图片储存在 `MULTIMODAL_IMAGE_PATH` 下，由鉴权 API 读取。私有上传默认一天过期，过期即拒绝读取，重建或重试命令同时清理过期文件。
+
+### 上传与查询
+
+| 路由 | 请求内容 |
+| --- | --- |
+| `POST /api/v1/images` | multipart 表单 `file`，可选 `conversation_id` |
+| `GET /api/v1/images/{image_id}` | Bearer 鉴权后读取规范化 JPEG |
+| `DELETE /api/v1/images/{image_id}` | 上传者或所属租户的商品图库管理员 |
+| `POST /api/v1/multimodal/search/by-image` | `image_id`、可选 `top_k` |
+| `POST /api/v1/multimodal/search/text-by-image` | `image_id`、可选 `top_k` |
+| `POST /api/v1/multimodal/search/by-text` | `query`、可选 `top_k` 和 `filters` |
+| `POST /api/v1/multimodal/search/by-image-and-text` | `image_id`、`query`、可选 `top_k` 和 `filters` |
+
+过滤器支持 `max_price_cents`、`category`、`in_stock`。例如 500 元以内传入 `"filters":{"max_price_cents":50000}`。检索使用 512 维余弦相似度排序，再用 SQLite 校验商品和过滤条件。商品卡片的名称、价格和库存来自商品表。相似度用于候选排序，型号需要结合实际规格确认。
+
+```json
+{
+  "conversation_id": "<existing-conversation-id>",
+  "message": "找类似的商品，价格不超过 500 元",
+  "image_ids": ["<uploaded-image-id>"],
+  "allow_external_image_send": false
+}
+```
+
+原 `/api/v1/chat` 和 SSE 可接收上述附件字段。图片在上传指定会话或首次聊天时绑定。结果可能包含 `cards`，其中的 `image_url` 需要当前 Bearer Token。独立检索 API 只依赖本地 CLIP 和索引，聊天决策继续使用配置的模型。
+
+### 外部 VLM
+
+确认目标端点同时支持 Chat Completions 的 `image_url` data URI 和原生工具调用后，在本地 `.env` 设置：
+
+```dotenv
+LLM_BASE_URL=<provider-endpoint>
+LLM_API_KEY=<provider-key>
+LLM_MODEL=<text-chat-model>
+VLM_MODEL=<vision-tool-calling-model>
+MULTIMODAL_EXTERNAL_VLM_IMAGES_ENABLED=true
+VLM_PROVIDER_TRANSPORT=data_uri
+VLM_SUPPORTS_VISION=true
+VLM_SUPPORTS_TOOL_CALLING=true
+```
+
+当前 VLM 使用同一组端点和凭据，通过 `VLM_MODEL` 选择视觉模型。服务端开启后，每次聊天还须明确传入 `allow_external_image_send: true`，或勾选工作台的本次授权。网关读取已授权图片，缩放并编码为供应商接收的 JPEG data URI。现有供应商仅支持文字时，请保留本地检索或配置支持该请求格式的端点。部署前运行下方的真实 VLM 冒烟以核实能力开关。
+
+### 验收和排错
+
+```powershell
+python scripts/generate_multimodal_test_assets.py --output-dir tests/fixtures/multimodal
+python -m pytest tests/multimodal -q -rs
+python scripts/multimodal_smoke.py --run-local-model
+# 配置了兼容供应商并同意外发生成的工程图片后，再运行
+python scripts/multimodal_smoke.py --run-external-vlm
+```
+
+工程测试使用少量 Pillow 生成图、确定性测试编码器和 HTTP Mock。真实本地冒烟使用官方模型与 Chroma，输出向量形状、索引数量和耗时。当前没有标注商品图集，因此无语义检索准确率。
+
+从调试页、`X-Trace-ID`（图片与检索）、聊天响应或错误体取得 Trace ID，用原 Bearer Token 请求 `GET /api/v1/traces/{trace_id}`。本地结构化事件亦位于检查点同级 `traces/`。已登记商品图但索引未建好时检查 `INDEX_NOT_READY` 和索引作业。缺少权重时根据 `MULTIMODAL_MODEL_NOT_READY` 提示执行下载。
+
+适配依据见 [Chinese-CLIP 模型仓库](https://huggingface.co/OFA-Sys/chinese-clip-vit-base-patch16/tree/36e679e65c2a2fead755ae21162091293ad37834) 和 [Chat Completions 请求格式](https://platform.openai.com/docs/api-reference/chat/create)。

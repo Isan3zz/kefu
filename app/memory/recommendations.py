@@ -6,13 +6,14 @@ from app.memory.validator import normalized
 AMOUNT = r'([0-9]{1,6}(?:\.[0-9]{1,2})?|[零一二两三四五六七八九十百千]{1,9})(?![0-9.,零一二两三四五六七八九十百千])'
 BUDGET = re.compile(r'预算\s*(?:(?:一般|通常|最高|可以|控制在|不超过|不高于|上限|最多|到|为|约|就|在|是|只有|仅)\s*){0,6}' + AMOUNT + r'\s*(?:元|块)?')
 CURRENT_LIMIT = re.compile(AMOUNT + r'\s*(?:元|块)\s*(?:以内|以下|封顶)')
+PREFIX_LIMIT = re.compile(r'(?:不超过|不高于|最多|最高)\s*' + AMOUNT + r'\s*(?:元|块)')
 DIGITS = {char: value for value, char in enumerate('零一二三四五六七八九')} | {'两': 2}
 UNITS = {'十': 10, '百': 100, '千': 1000}
 
 
 def ceiling(text):
     text = normalized(text)
-    match = BUDGET.search(text) or CURRENT_LIMIT.search(text)
+    match = BUDGET.search(text) or CURRENT_LIMIT.search(text) or PREFIX_LIMIT.search(text)
     if not match or re.match(r'[\s]*(?:到|至|-|~|左右|以上|起|万|亿)', text[match.end():]):
         return None
     amount = match[1]

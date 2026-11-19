@@ -168,7 +168,7 @@ class RAG:
                 c.execute(knowledge_snapshots.update().where(knowledge_snapshots.c.id=='active').values(payload=payload))
             else: c.execute(knowledge_snapshots.insert().values(id='active',payload=payload))
         return manifest
-    def search(self,query,tenant,mode='hybrid_rerank',k=None):
+    def search(self,query,tenant,mode='hybrid_rerank',k=None,*,document_ids=None):
         if mode not in ('dense','bm25','hybrid','hybrid_rerank'): raise ValueError('Invalid retrieval mode')
         started=time.perf_counter()
         with self.db.tx() as c:
@@ -178,6 +178,8 @@ class RAG:
         rows=json.loads(Path(manifest['bm25']).read_text(encoding='utf-8'))
         # Enforce current DB governance BEFORE both retrieval branches, including stale index entries.
         rows=[r for r in rows if r['document_id'] in docs and visible(docs[r['document_id']],tenant) and json.loads(r['metadata_json'])['version']==docs[r['document_id']]['version']]
+        if document_ids is not None:
+            rows = [row for row in rows if row['document_id'] in document_ids]
         if not rows: return []
         by_id={r['chunk_id']:r for r in rows}; rankings=[]; stages={}
         if mode!='bm25':
@@ -201,7 +203,7 @@ class RAG:
             scores=self.model().score([(query,by_id[cid]['content']) for cid in chosen])
             rerank=dict(zip(chosen,map(float,scores))); chosen.sort(key=lambda cid:(-rerank[cid],cid)); stages['rerank_ms']=(time.perf_counter()-t)*1000
         revisions={key+'_revision':value.get('revision') if isinstance(value,dict) else value for key,value in manifest['models'].items() if key in ('embedding','reranker')}
-        return [dict(chunk_id=cid,content=by_id[cid]['content'],document_title=docs[by_id[cid]['document_id']]['title'],version=docs[by_id[cid]['document_id']]['version'],source=docs[by_id[cid]['document_id']]['source_path'],retrieval_rank=idx,rrf_score=fusion[cid],rerank_score=rerank.get(cid),snapshot=manifest['snapshot'],stages=stages,latency_ms=(time.perf_counter()-started)*1000,**revisions) for idx,cid in enumerate(chosen[:k or self.config.retrieval_context_k],1)]
+        return [dict(chunk_id=cid,doc_id=by_id[cid]['document_id'],content=by_id[cid]['content'],document_title=docs[by_id[cid]['document_id']]['title'],version=docs[by_id[cid]['document_id']]['version'],source=docs[by_id[cid]['document_id']]['source_path'],retrieval_rank=idx,rrf_score=fusion[cid],rerank_score=rerank.get(cid),snapshot=manifest['snapshot'],stages=stages,latency_ms=(time.perf_counter()-started)*1000,**revisions) for idx,cid in enumerate(chosen[:k or self.config.retrieval_context_k],1)]
 
 def model_manifest():
     path=Path('models/model_manifest.json')

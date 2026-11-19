@@ -31,7 +31,7 @@ async def test_H18_thread_lock_parallelism_and_cleanup(env):
 
 def test_context_budget_configuration_rejected(env):
     with pytest.raises(ValueError): ContextBudget(model_context_window=10,reserved_output_tokens=5,safety_margin_tokens=2,max_input_tokens=4)
-    with pytest.raises(ValueError): type(env['cfg'])(context_max_input_tokens=20000)
+    with pytest.raises(ValueError): type(env['cfg'])(model_context_window=16000, context_max_input_tokens=20000)
 
 def test_H06_expired_context_cannot_continue(env):
     from dataclasses import replace

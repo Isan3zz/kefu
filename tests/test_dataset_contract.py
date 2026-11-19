@@ -1,7 +1,7 @@
 import json
 import pytest
 from app.dataset import load_dataset
-from app.evaluation import assertions,compare
+from app.evaluation import assertions,compare,response_assertions
 from app.evaluation import FieldEvaluator
 
 def test_independent_evaluator_has_explicit_not_applicable_state():
@@ -35,6 +35,23 @@ def test_tool_argument_mismatch_is_not_a_tool_selection_success():
     result=assertions(case,{'tool_events':[{'name':'get_order','args':{'order_id':'O2001'}}]},{} )
     assert result[0]['passed'] is True
     assert result[1]['failure_category']=='TOOL_ARGUMENT_ERROR'
+
+def test_turn_checks_require_visible_answer_text_and_citation():
+    step = {'answer_contains':['保修'], 'answer_contains_any':['一年','12 个月'], 'citation_required':True}
+    response = {'answer':'保修 12 个月', 'citations':[{'chunk_id':'verified'}]}
+    results = list(response_assertions('case-001', 2, step, response))
+    assert [result['passed'] for result in results] == [True, False]
+    assert results[1]['evidence']['step'] == 2
+    response['answer'] = '保修 3 个月 [verified]'
+    results = list(response_assertions('case-001', 2, step, response))
+    assert [result['passed'] for result in results] == [False, True]
+
+def test_turn_answer_check_accepts_bold_and_label_formatting():
+    step = {'answer_contains':['库存 20 件']}
+    result, = response_assertions('case-001', 1, step, {'answer':'- **库存**：20 件。'})
+    assert result['passed']
+    mismatch, = response_assertions('case-001', 1, step, {'answer':'库存 **2 件**。'})
+    assert not mismatch['passed']
 
 def test_new_safety_category_blocks_even_when_case_was_already_failing():
     def report(category):

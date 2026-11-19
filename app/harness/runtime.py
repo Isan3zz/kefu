@@ -21,20 +21,34 @@ class HarnessServices:
     telemetry:Telemetry
     budget:RunBudget
     context:object=None
+    image_ids:tuple[str, ...]=()
+    allow_external_image_send:bool=False
 
 class HarnessFacade:
     def __init__(self,agent,model_gateway=None,fake_gateway=None):
         self.agent=agent; self.config=agent.config; self.b=agent.b
         self.controller=RunController(self.b,self.config)
-        self.model=model_gateway or ModelGateway(self.config,client_factory=lambda:agent.llm())
+        from app.multimodal.vlm_image_adapter import VLMImageAdapter
+        self.model=model_gateway or ModelGateway(self.config,client_factory=lambda:agent.llm(),
+                                                 image_adapter=VLMImageAdapter(agent.images))
         self.fake_model=fake_gateway or FakeModelGateway(self.config)
         self.guard=PolicyGuard(self.b,agent.skills,self.config)
         self.tools=ToolExecutor(agent.gateway,self.guard,self.config,self.controller)
     async def close(self):
         await self.controller.close()
         await self.model.close()
-    async def invoke_chat(self,*,principal,conversation_id,message,client_request_id=None,evaluation=None,mode='real',skill_mode='selected',legacy=False):
+    async def invoke_chat(self,*,principal,conversation_id,message,client_request_id=None,evaluation=None,mode='real',skill_mode='selected',legacy=False,image_ids=(),allow_external_image_send=False):
         body={'kind':'chat','message':message,'mode':mode,'skill_mode':skill_mode}
+        if image_ids:
+            if not self.config.multimodal_enabled:
+                raise DomainError('MULTIMODAL_DISABLED')
+            if len(image_ids) > self.config.multimodal_max_chat_images or len(set(image_ids)) != len(image_ids):
+                raise DomainError('INVALID_ARGUMENT', '图片数量超过限制或包含重复附件')
+            body['image_ids'] = list(image_ids)
+        if allow_external_image_send:
+            if not image_ids or mode != 'real':
+                raise DomainError('INVALID_ARGUMENT', '外发授权须用于包含图片的真实模型请求')
+            body['allow_external_image_send'] = True
         return await self._invoke(principal,conversation_id,'conv:'+conversation_id,body,client_request_id,None,mode,evaluation,legacy,lambda ctx,services:self.agent._chat(principal,conversation_id,message,mode,skill_mode,ctx,services))
     async def resume_workflow(self,*,principal,workflow_id,confirmation_payload,client_request_id=None,legacy=False):
         workflow=self.b.workflow(principal,workflow_id)
@@ -58,13 +72,25 @@ class HarnessFacade:
     async def _invoke(self,principal,conv,thread,body,key,wid,mode,evaluation,legacy,operation):
         if not self.config.harness_enabled: raise HarnessFailure('CONFIG_ERROR','HARNESS_ENABLED=false 已暂停 Agent 执行；不会绕过运行时安全控制')
         ctx,replay=self.controller.begin(principal,conv,thread,body,key,wid,mode,evaluation or evaluation_context.get())
-        if replay is not None: return replay
+        if replay is not None:
+            if body.get('image_ids'):
+                await asyncio.to_thread(self.agent.images.bind, principal, conv, body['image_ids'])
+            if 'cards' in replay:
+                from app.memory.recommendations import ceiling
+                replay['cards'] = await asyncio.to_thread(
+                    self.agent.multimodal.revalidate_cards, principal, replay.get('tool_actions', []),
+                    ceiling(body['message']))
+            return replay
         budget=RunBudget(); telemetry=Telemetry(ctx,self.config.harness_trace_enabled)
-        recorder=TraceRecorder(self.b,principal,conv,self.config,trace_id=ctx.trace_id,invocation_id=ctx.invocation_id,parent_invocation_id=ctx.parent_invocation_id,graph_thread_id=ctx.graph_thread_id,workflow_id=wid,model_id='FakeModelGateway' if mode=='deterministic' else self.config.llm_model)
+        model_id = ('FakeModelGateway' if mode == 'deterministic' else
+                    self.config.vlm_model if body.get('allow_external_image_send') else self.config.llm_model)
+        recorder=TraceRecorder(self.b,principal,conv,self.config,trace_id=ctx.trace_id,invocation_id=ctx.invocation_id,parent_invocation_id=ctx.parent_invocation_id,graph_thread_id=ctx.graph_thread_id,workflow_id=wid,model_id=model_id)
         # Injected services are explicit; audit ContextVar is not an authorization source.
         services=HarnessServices(self.fake_model if mode=='deterministic' else self.model,self.tools,telemetry,budget)
         from app.harness.context_manager import ContextManager
         services.context=ContextManager(self.b,self.config)
+        services.image_ids=tuple(body.get('image_ids', ()))
+        services.allow_external_image_send=body.get('allow_external_image_send', False)
         async def execute():
             marker=active_trace.set(recorder); result=None; status='FAILED'; code=None
             self.controller.update(ctx,status='RUNNING',started_at=now())
@@ -73,6 +99,11 @@ class HarnessFacade:
                 async with asyncio.timeout(ctx.remaining()):
                     async with self.controller.locks.acquire(thread):
                         ctx.remaining()
+                        if services.image_ids:
+                            await asyncio.to_thread(self.agent.images.bind, ctx.principal, conv, services.image_ids)
+                            if not services.allow_external_image_send:
+                                telemetry.emit('vlm.image.rejected', error_code='VLM_IMAGE_SEND_DISABLED',
+                                               status='blocked', count=len(services.image_ids))
                         if legacy and mode=='real' and body['kind']=='chat':
                             try: self.model.get_client()
                             except HarnessFailure as e:
@@ -121,7 +152,7 @@ class HarnessFacade:
                 safe=clean(result) if result is not None else {'error_code':code,'answer':'执行未完成，请查询原操作状态','invocation_id':ctx.invocation_id,'trace_id':ctx.trace_id,'invocation_status':status}
                 if safe.get('pending_confirmation'): safe['pending_confirmation']['confirmation_credential_available']=False
                 self.controller.update(ctx,status=status,error_code=code,finished_at=now(),response_message_id=(result or {}).get('message_id'),response_json=json.dumps(safe,ensure_ascii=False),model_calls=budget.model_calls,tool_calls=budget.tool_calls,prompt_tokens=budget.prompt_tokens if budget.provider_usage_complete else None,completion_tokens=budget.completion_tokens if budget.provider_usage_complete else None)
-                recorder.payload.update(model_attempts=budget.model_attempts,tool_attempts=budget.tool_attempts,step_count=budget.steps,error_class=error_class(code) if code else None,unknown_outcome=status=='UNKNOWN_OUTCOME',invocation_status=status)
+                recorder.payload.update(model_attempts=budget.model_attempts,tool_calls=budget.tool_calls,tool_attempts=budget.tool_attempts,step_count=budget.steps,error_class=error_class(code) if code else None,unknown_outcome=status=='UNKNOWN_OUTCOME',invocation_status=status)
                 try:
                     recorder.finish(business_outcome=self.b.workflow(principal,wid)['status'] if wid else (result or {}).get('pending_confirmation',{}).get('status','NONE') if (result or {}).get('pending_confirmation') else 'NONE')
                 finally:

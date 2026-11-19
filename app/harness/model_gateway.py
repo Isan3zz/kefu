@@ -1,5 +1,6 @@
 """The single OpenAI-compatible request site for decisions, answering and Judge."""
 import asyncio,hashlib,json,time
+from app.business import DomainError
 from collections import deque
 from app.db import uid
 from pydantic import ValidationError
@@ -12,12 +13,13 @@ def estimate_tokens(messages):
     return 8+sum(8+len((json.dumps(m, ensure_ascii=False) if 'tool_calls' in m else str(m.get('content',''))).encode('utf-8')) for m in messages)
 
 class ModelGateway:
-    def __init__(self,config,client_factory=None):
+    def __init__(self,config,client_factory=None,image_adapter=None):
         self.config,self.client_factory=config,client_factory
+        self.image_adapter = image_adapter
         self.client=None
     def get_client(self):
         if self.client_factory: return self.client_factory()
-        if not all((self.config.llm_api_key,self.config.llm_base_url,self.config.llm_model)):
+        if not all((self.config.llm_api_key,self.config.llm_base_url,self.config.llm_model or self.config.vlm_model)):
             raise HarnessFailure('CONFIG_ERROR','真实聊天需要配置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL',source='model')
         if self.client is None:
             from openai import AsyncOpenAI
@@ -25,12 +27,23 @@ class ModelGateway:
         return self.client
     async def close(self):
         if self.client: await self.client.close()
-    async def complete_with_tools(self, *, ctx, messages, tool_schemas, budget, telemetry, **unused):
+    async def complete_with_tools(self, *, ctx, messages, tool_schemas, budget, telemetry,
+                                  image_ids=(), image_consent=False, **unused):
         return await self.complete(ctx=ctx, messages=messages, purpose='agent_loop', tool_schemas=tool_schemas,
-                                   budget=budget, telemetry=telemetry)
+                                   budget=budget, telemetry=telemetry, image_ids=image_ids, image_consent=image_consent)
 
-    async def complete(self,*,ctx,messages,purpose,response_schema=None,temperature=None,budget,telemetry,model_id=None,tool_schemas=None,**unused):
-        model_id=model_id or self.config.llm_model
+    async def complete(self,*,ctx,messages,purpose,response_schema=None,temperature=None,budget,telemetry,model_id=None,tool_schemas=None,image_ids=(),image_consent=False,**unused):
+        if image_ids:
+            try:
+                if self.image_adapter is None:
+                    raise DomainError('VLM_NOT_CONFIGURED', 'VLM 图片适配器未配置')
+                self.image_adapter.check_capabilities(image_consent, tools=tool_schemas is not None)
+            except DomainError as error:
+                telemetry.emit('vlm.image.rejected', status='blocked', error_code=error.code, count=len(image_ids))
+                raise
+            model_id = self.config.vlm_model
+        else:
+            model_id=model_id or self.config.llm_model
         ctx.remaining(); budget.model_calls+=1
         start=time.perf_counter(); attempt=0; repairs=0; transient=0; timeouts=0; operation=uid('model-op-')
         request=[dict(m) for m in messages]
@@ -41,6 +54,7 @@ class ModelGateway:
         while True:
             ctx.remaining()
             input_estimate=estimate_tokens(request)+(len(json.dumps(tool_schemas).encode()) if tool_schemas else 0)
+            input_estimate += len(image_ids) * self.config.multimodal_image_token_estimate
             estimate=input_estimate+self.config.model_max_output_tokens
             if input_estimate>self.config.context_max_input_tokens:
                 raise HarnessFailure('CONTEXT_BUDGET_EXCEEDED','模型 Schema 与必要上下文超出输入预算',source='model')
@@ -53,9 +67,38 @@ class ModelGateway:
                 options={'model':model_id,'messages':request,'temperature':0 if temperature is None else temperature,'max_tokens':self.config.model_max_output_tokens}
                 if response_schema and self.config.model_json_mode: options['response_format']={'type':'json_object'}
                 if tool_schemas is not None: options.update(tools=tool_schemas, tool_choice='auto')
+                prepared = []
                 async with asyncio.timeout(timeout):
+                    if image_ids:
+                        telemetry.emit('vlm.image.prepare_started', count=len(image_ids), model_id=model_id)
+                        prepared = await asyncio.to_thread(self.image_adapter.prepare, ctx, image_ids, consent=image_consent)
+                        options['messages'] = self.image_adapter.attach(request, prepared)
+                        for image in prepared:
+                            telemetry.emit('vlm.image.payload_created', image_id=image.image_id, byte_size=len(image.content),
+                                           mime_type=image.mime_type, width=image.width, height=image.height,
+                                           provider_transport='data_uri', model_id=model_id)
                     response=await client.with_options(max_retries=0,timeout=timeout).chat.completions.create(**options)
-                content=response.choices[0].message.content or ''
+                message = response.choices[0].message
+                if prepared:
+                    for image in prepared:
+                        telemetry.emit('vlm.image.sent', image_id=image.image_id, byte_size=len(image.content),
+                                       mime_type=image.mime_type, provider_transport='data_uri', model_id=model_id)
+                    request_bytes = len(json.dumps(options, ensure_ascii=False, separators=(',', ':')).encode())
+                    telemetry.emit('vlm.request.completed', provider_request_bytes=request_bytes, count=len(prepared))
+                    # Prevent a provider echo from reaching a graph checkpoint or a tool observation.
+                    parts = next(m['content'] for m in options['messages'] if m['role']=='user')
+                    encoded = [part['image_url']['url'].split(',', 1)[1] for part in parts if part['type']=='image_url']
+                    def redact_echo(text):
+                        for value in encoded:
+                            text = text.replace('data:image/jpeg;base64,' + value, '[IMAGE_REDACTED]')
+                            text = text.replace(value, '[IMAGE_REDACTED]')
+                        return text
+                    if message.content:
+                        message.content = redact_echo(message.content)
+                    for call in message.tool_calls or ():
+                        if call.type == 'function':
+                            call.function.arguments = redact_echo(call.function.arguments)
+                content=message.content or ''
                 raw=response.usage
                 usage=ModelUsage(input_tokens=raw.prompt_tokens,output_tokens=raw.completion_tokens,total_tokens=raw.total_tokens,source='provider') if raw and raw.prompt_tokens is not None and raw.completion_tokens is not None else ModelUsage()
                 usages.append(usage)
@@ -66,7 +109,7 @@ class ModelGateway:
                 if not response_schema and tool_schemas is None and not content.strip(): raise ValueError('Empty model result')
                 total_usage=ModelUsage(input_tokens=sum(u.input_tokens or 0 for u in usages),output_tokens=sum(u.output_tokens or 0 for u in usages),total_tokens=sum(u.total_tokens if u.total_tokens is not None else (u.input_tokens or 0)+(u.output_tokens or 0) for u in usages),source='provider') if len(usages)==attempt and all(u.source=='provider' for u in usages) else ModelUsage()
                 result=ModelResult(text=content,structured=parsed,model_id=model_id,usage=total_usage,attempts=attempt,latency_ms=(time.perf_counter()-start)*1000,finish_reason=response.choices[0].finish_reason)
-                decision=decision_from_response(response.choices[0].message,model_id,result.finish_reason) if tool_schemas is not None else result
+                decision=decision_from_response(message,model_id,result.finish_reason) if tool_schemas is not None else result
                 telemetry.emit('model.completed',purpose=purpose,model_id=result.model_id,operation_id=operation,attempts=attempt,duration_ms=result.latency_ms,usage_source=result.usage.source,input_tokens=result.usage.input_tokens,output_tokens=result.usage.output_tokens)
                 from app.observability import emit
                 emit('llm',stage=purpose,model=result.model_id,duration_ms=result.latency_ms,attempts=attempt,usage={'prompt_tokens':result.usage.input_tokens,'completion_tokens':result.usage.output_tokens},usage_source=result.usage.source)
@@ -74,14 +117,18 @@ class ModelGateway:
             except asyncio.CancelledError: raise
             except Exception as exc:
                 if len(usages)<attempt: budget.provider_usage_complete=False
-                if isinstance(exc,HarnessFailure): code=exc.code
+                if isinstance(exc,DomainError): code=exc.code
                 elif isinstance(exc,(ValidationError,ValueError,IndexError,TypeError)): code='MODEL_BAD_OUTPUT'
                 elif isinstance(exc,TimeoutError) or type(exc).__name__=='APITimeoutError': code='MODEL_TIMEOUT'
                 else:
                     status=getattr(exc,'status_code',None)
                     code='CONFIG_ERROR' if status in (401,403) else 'MODEL_RATE_LIMIT' if status==429 else 'MODEL_UPSTREAM_ERROR'
-                    if tool_schemas is not None and status in (400,422) and 'tool' in str(exc).lower():
+                    if status in (400, 415, 422) and image_ids:
+                        code = 'VLM_TOOL_CALLING_UNSUPPORTED' if 'tool' in str(exc).lower() else 'VLM_VISION_UNSUPPORTED'
+                    elif tool_schemas is not None and status in (400,422) and 'tool' in str(exc).lower():
                         code='MODEL_TOOL_CALLING_UNSUPPORTED'
+                if image_ids:
+                    telemetry.emit('vlm.image.rejected', error_code=code, status='error', count=len(image_ids))
                 if ctx.deadline_monotonic<=time.monotonic(): code='RUN_TIMEOUT'
                 telemetry.emit('model.failed',purpose=purpose,model_id=model_id,operation_id=operation,attempts=attempt,attempt_no=attempt,error_code=code,status='error',error_type=type(exc).__name__)
                 if code=='MODEL_BAD_OUTPUT' and repairs<1 and attempt<2+self.config.model_max_retries:
@@ -94,8 +141,14 @@ class ModelGateway:
                     timeouts+=1; await backoff(ctx,attempt,telemetry,code); continue
                 from app.observability import emit
                 emit('llm',stage=purpose,model=model_id,duration_ms=(time.perf_counter()-start)*1000,attempts=attempt,usage={},usage_source='unavailable',error_code=code,status='error')
-                if isinstance(exc,HarnessFailure): raise
-                raise HarnessFailure(code,'当前模型或 API 不支持原生工具调用，请检查主模型配置' if code=='MODEL_TOOL_CALLING_UNSUPPORTED' else '模型返回暂不可用，请重试或转人工',source='model') from None
+                if isinstance(exc,DomainError): raise
+                explanations = {
+                    'MODEL_TOOL_CALLING_UNSUPPORTED': '当前模型或 API 不支持原生工具调用，请检查主模型配置',
+                    'VLM_VISION_UNSUPPORTED': '外部 VLM 拒绝图片请求，请检查供应商的 data URI 支持和限制',
+                    'VLM_TOOL_CALLING_UNSUPPORTED': '外部 VLM 拒绝图片与工具调用的组合，请检查模型能力',
+                }
+                raise HarnessFailure(code, explanations.get(code, '模型返回暂不可用，请重试或转人工'),
+                                     source='model') from None
 
 class FakeModelGateway:
     """Explicit offline adapter with a deterministic action policy."""

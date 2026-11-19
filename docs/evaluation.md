@@ -76,3 +76,41 @@ none 提前停止，不能将它较少的累计输入估算直接解读为成本
 报告保存在 `data/eval_runs/<run_id>/`，包含 Markdown/HTML/JSON、各变体的 Trace JSONL / SQLite 索引、发布和数据 SHA、成对指标差值及失败 case。提取调用率只使用写入阶段用户轮数为分母，按实际 Gateway attempts 计数。Flush 延迟为 fixture 时钟下从缓冲到写入的时间；检索/查询延迟另记实时时钟。Fake 的 Token 只作估算，不提供供应商用量或费用。
 
 可加 `--embedding local` 验证真实本地模型；仍默认使用脚本化的提取 Gateway。`--mode agent-real` 单独显式启用配置的外部主模型，只对虚构数据使用。语义评估、成本和生产精度不能由 Fake 结果外推。实际运行结果和限制见 `IMPLEMENTATION_REPORT.md`。
+
+## 复合任务评测
+
+```powershell
+.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/compound_tasks.jsonl --mode agent-real --agent-release compound-v2-cold
+```
+
+数据集包含六条单轮多目标任务和六条多轮任务。每条使用独立订单 fixture，要求关键工具、参数、必要的执行顺序、业务终态和用户可见回复均满足断言。对政策查询，检查回复中的目标事实片段与至少一条实际检索到的引用，原有引用有效性和权限审计也会执行。
+
+- `end_to_end_task_pass_rate` 为全部断言通过的任务数除以已判定任务数。未决写入单列，按 Harness 口径排除出通过率分母。
+- `avg_tool_calls_per_task` 为任务中各次调用的 Harness 工具计数之和，除以有计数记录的任务数。分母包含失败和零调用任务。计数包括实际发起的业务工具、本地检索、技能加载和确认后触发的提交。传输重试归入同一次工具调用，被拦截的提议不计数。报告中的 `tool_call_count` 可逐案核对。
+
+上述命令在新进程启动时按需加载本地模型。复现预热口径时，在调用 `app.evaluation.run` 的同一进程先执行一次真实混合检索，预热调用不纳入任务计数。
+
+```powershell
+$env:PYTHONUTF8='1'
+$env:OMP_NUM_THREADS='8'
+$env:MKL_NUM_THREADS='8'
+@'
+import asyncio
+from app.config import settings
+from app.db import DB
+from app.evaluation import run
+from app.rag import RAG
+
+rag = RAG(DB(settings.sqlite_url), config=settings)
+try:
+    evidence = rag.search('已送达订单的退款时限和确认要求', 'a', 'hybrid_rerank')
+    assert evidence, 'Missing warm-up evidence'
+finally:
+    rag.close()
+    rag.db.engine.dispose()
+report = asyncio.run(run('datasets/compound_tasks.jsonl', 'agent-real', 'compound-v2-final'))
+print(report['run_id'])
+'@ | .venv/Scripts/python.exe -
+```
+
+正式报告和 Trace 保存在 `data/eval_runs/<run-id>/`。文本片段与引用断言覆盖预设事实，开放式语义质量需另行评估。

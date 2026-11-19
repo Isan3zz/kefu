@@ -108,3 +108,26 @@ async def test_import_is_idempotent_preserves_existing_data_and_is_tenant_scoped
     finally:
         await agent.close()
         db.engine.dispose()
+
+
+async def test_product_search_filters_before_limit_and_keeps_stock_checks_available(env):
+    import_product_fixtures(env['db'])
+
+    async def search(**kwargs):
+        return await env['gateway'].call(env['a'], 'search_products', kwargs, 'product-consultation')
+
+    priced = await search(min_price_cents=15900, max_price_cents=17900, in_stock_only=True, limit=1)
+    assert priced['ok'] and [row['id'] for row in priced['data']]==['yt-lite-tws']
+
+    highest = await search(min_price_cents=99900, in_stock_only=True)
+    assert highest['ok'] and [row['id'] for row in highest['data']]==['yt-studio-headset']
+
+    mini = await search(keyword='Mini', max_price_cents=19900)
+    assert mini['ok'] and [row['stock'] for row in mini['data']]==[0]
+    exclusive = await search(keyword='Mini', max_price_cents=19899)
+    in_stock = await search(keyword='Mini', in_stock_only=True)
+    assert exclusive['ok'] and exclusive['data']==[]
+    assert in_stock['ok'] and in_stock['data']==[]
+
+    invalid = await search(min_price_cents=17900, max_price_cents=15900)
+    assert not invalid['ok'] and invalid['error']['code']=='INVALID_ARGUMENT'

@@ -49,7 +49,7 @@ def test_alembic_empty_database_and_upgrade_preserve_existing_orders(tmp_path,mo
     assert set(metadata.tables).issubset(inspect(db.engine).get_table_names())
     with db.tx() as connection:
         assert [dict(r) for r in connection.execute(select(orders)).mappings()]==existing
-        assert connection.exec_driver_sql('SELECT version_num FROM alembic_version').scalar()=='0004'
+        assert connection.exec_driver_sql('SELECT version_num FROM alembic_version').scalar()=='0005'
     migrate('downgrade','0001')
     with db.tx() as connection: assert len(connection.execute(select(orders)).all())==len(existing)
     migrate('upgrade','head')

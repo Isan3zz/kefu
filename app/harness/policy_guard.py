@@ -1,18 +1,22 @@
 import hashlib,json
 from pydantic import BaseModel,ConfigDict,Field,StrictStr
 from sqlalchemy import select
+from app.business import ProductSearch as Products
 from app.db import conversations,workflow_instances
 from app.harness.contracts import HarnessFailure
+from app.multimodal.retrieval import TOOL_ARGS
 
 class Arguments(BaseModel): model_config=ConfigDict(extra='forbid',strict=True)
 class ListOrders(Arguments): limit:int=Field(default=10,ge=1,le=20)
 class Order(Arguments): order_id:StrictStr=Field(min_length=1,max_length=100)
-class Products(Arguments): keyword:str=Field(default='',max_length=1000); limit:int=Field(default=10,ge=1,le=20)
 class Ticket(Arguments): category:str=Field(min_length=1,max_length=100); summary:str=Field(min_length=1,max_length=10000); conversation_id:str
 class Refund(Arguments): workflow_id:str
 class SkillName(Arguments): name:str=Field(min_length=1,max_length=80)
-class KnowledgeQuery(Arguments): query:str=Field(min_length=1,max_length=1000)
-INTERNAL_SCHEMAS={'load_skill':SkillName,'search_knowledge':KnowledgeQuery,'begin_refund_workflow':Order}
+class KnowledgeQuery(Arguments):
+    query:str=Field(min_length=1,max_length=1000)
+    product_id:str|None=Field(default=None,min_length=1,max_length=100)
+
+INTERNAL_SCHEMAS={'load_skill':SkillName,'search_knowledge':KnowledgeQuery,'begin_refund_workflow':Order, **TOOL_ARGS}
 SCHEMAS={'get_orders':ListOrders,'get_order':Order,'track_shipment':Order,'search_products':Products,'check_refund_eligibility':Order,'create_ticket':Ticket,'submit_refund_request':Refund}
 READ_TOOLS=frozenset(SCHEMAS)-{'create_ticket','submit_refund_request'}
 
