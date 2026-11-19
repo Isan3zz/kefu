@@ -17,7 +17,7 @@ DESCRIPTIONS = {
     'get_orders': 'List orders owned by the signed-in customer.',
     'get_order': 'Read one referenced order including existing refund status.',
     'track_shipment': 'Track the referenced order with live shipment facts.',
-    'search_products': 'Look up live products, colors, stock and prices. Use an empty keyword if the actual catalog name is unknown.',
+    'search_products': 'Look up live catalog products by a name keyword. Results include current price, stock and product attributes such as fit, noise cancellation and device connections. Use an empty keyword if the catalog name is unknown.',
     'check_refund_eligibility': 'Check refund eligibility only. For a specific request to start a refund, call begin_refund_workflow instead.',
     'begin_refund_workflow': 'For an explicit refund application, check eligibility and prepare a user confirmation. Never submits refunds. Do not use for eligibility-only, status, acknowledgements or policy questions. Call alone.',
     'create_ticket': 'Create a human handoff ticket when explicitly requested (转人工/人工客服) or when a complaint needs escalation. Call alone.',

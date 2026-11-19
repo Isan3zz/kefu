@@ -1,0 +1,46 @@
+{
+  "schema_version": "profile-seed-v1",
+  "purpose": "仅用于测试 user_a 的长期记忆注入与 Agent 商品工具调用，不创建新用户",
+  "actor": {
+    "tenant_id": "a",
+    "user_id": "user_a"
+  },
+  "memory_settings": {
+    "auto_write_enabled": false,
+    "retrieval_enabled": true
+  },
+  "memory_inputs": [
+    {
+      "memory_type": "stable_constraint",
+      "subject_key": "headphones.budget",
+      "content": "我买耳机通常预算不超过500元，主要用于办公室视频会议，优先考虑头戴式、主动降噪和双设备连接。"
+    },
+    {
+      "memory_type": "preference",
+      "subject_key": "headphones.form",
+      "content": "我喜欢头戴式耳机，不太接受入耳式耳机。"
+    },
+    {
+      "memory_type": "stable_fact",
+      "subject_key": "headphones.use",
+      "content": "我平时经常在办公室用耳机参加视频会议。"
+    },
+    {
+      "memory_type": "preference",
+      "subject_key": "headphones.features",
+      "content": "我更看重通话麦克风效果、主动降噪，以及同时连接电脑和手机。"
+    }
+  ],
+  "gold_profile": {
+    "use_case": "办公室视频会议",
+    "budget_max_cents": 50000,
+    "preferred_form_factor": "头戴式",
+    "avoid_form_factor": "入耳式",
+    "need_active_noise_cancellation": true,
+    "need_multipoint": true,
+    "prioritize_call_quality": true,
+    "matched_product_id": "yt-office-headset",
+    "matched_product_name": "云听 Office 头戴通话耳机",
+    "matched_product_price_cents": 45900
+  }
+}

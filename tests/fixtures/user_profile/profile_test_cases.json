@@ -1,0 +1,103 @@
+{
+  "schema_version": "profile-eval-v1",
+  "test_cases": [
+    {
+      "case_id": "profile-on-001",
+      "mode": "real",
+      "actor": "user_a",
+      "setup": {
+        "retrieval_enabled": true
+      },
+      "user_message": "推荐一款适合我的耳机。",
+      "required_checks": [
+        "memory.search_completed matched_count>=1",
+        "ContextManager 的 USER_MEMORY 实际包含至少一条属于 user_a 的有效耳机画像",
+        "至少调用一次 search_products，且未调用不相关的订单/退款写工具",
+        "根据实时商品事实，推荐结果优先选择 yt-office-headset；不可虚构价格、库存和型号功能"
+      ],
+      "gold": {
+        "expected_memory_subject_key_at_least_one_of": [
+          "headphones.budget",
+          "headphones.form",
+          "headphones.use",
+          "headphones.features"
+        ],
+        "recommended_product_id": "yt-office-headset",
+        "price_max_cents": 50000,
+        "forbidden_tools": [
+          "get_orders",
+          "get_order",
+          "track_shipment",
+          "begin_refund_workflow",
+          "submit_refund_request"
+        ]
+      },
+      "note": "工具只有 keyword+limit，不能要求它在参数中携带预算/ANC 等结构化筛选条件；应检查 Memory Context、工具调用、业务结果和最终推荐四个环节。"
+    },
+    {
+      "case_id": "profile-off-002",
+      "mode": "real",
+      "actor": "user_a",
+      "setup": {
+        "retrieval_enabled": false
+      },
+      "user_message": "推荐一款适合我的耳机。",
+      "required_checks": [
+        "USER_MEMORY 为空或未注入来自该画像的记忆",
+        "仍可调用 search_products 获取实时商品信息",
+        "不声称已读取用户偏好，也不把画像作为已知事实"
+      ],
+      "gold": {
+        "memory_injected": false,
+        "allowed_tools": [
+          "search_products",
+          "search_knowledge",
+          "load_skill"
+        ]
+      },
+      "note": "不能以是否调用 search_products 区分 Memory On/Off：这句话本身就要求商品推荐，关闭记忆后也应查商品。"
+    },
+    {
+      "case_id": "profile-current-budget-003",
+      "mode": "real",
+      "actor": "user_a",
+      "setup": {
+        "retrieval_enabled": true
+      },
+      "user_message": "这次预算只有200元，推荐一款适合我的耳机。",
+      "required_checks": [
+        "当前轮明确预算 200 元优先于历史画像中的 500 元",
+        "已推荐的商品必须实付展示价不高于200元且库存大于0",
+        "不能谎称 200 元以内存在同时满足头戴式、ANC、双设备连接的商品"
+      ],
+      "gold": {
+        "current_budget_max_cents": 20000,
+        "full_requirements_candidate_count": 0
+      },
+      "note": "当前代码在存在明确当轮预算时可能跳过记忆召回，这是预期的优先级行为；本用例不是记忆注入正例。"
+    },
+    {
+      "case_id": "profile-unrelated-004",
+      "mode": "real",
+      "actor": "user_a",
+      "setup": {
+        "retrieval_enabled": true
+      },
+      "user_message": "订单 O1002 的物流到哪了？",
+      "required_checks": [
+        "应调用 track_shipment，order_id=O1002",
+        "不因为耳机画像而改走商品推荐",
+        "回答中不应无关提及预算、头戴式等用户偏好"
+      ],
+      "gold": {
+        "required_tool": "track_shipment",
+        "order_id": "O1002",
+        "forbidden_tools": [
+          "search_products",
+          "begin_refund_workflow",
+          "submit_refund_request"
+        ]
+      }
+    }
+  ]
+}

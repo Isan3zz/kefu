@@ -11,7 +11,9 @@ FACT_MARKER = re.compile(r'\{\{([BK][1-9][0-9]*)\}\}')
 NON_FACT = re.compile('|'.join(map(re.escape, FRAMING)) + r'|[\s，、。；：！？,:;.!?]+')
 REPLY_INSTRUCTION = (
     '\n如果 current_task.reply_facts 存在，且不需要再调用工具，请用普通中文连接已核实事实：'
-    '以 {{B1}} 这样的标签代表整个业务事实，所有 B 标签恰好出现一次；有 K 标签时至少选一个相关知识证据。'
+    '以 {{B1}} 这样的标签代表已核实事实。普通 B 标签恰好出现一次；'
+    '若某些 B 标签带 selection_group=product_candidate，只选择一个最符合当轮约束与 USER_MEMORY（若有）的候选，不要列出全部商品。'
+    '有 K 标签时至少选一个相关知识证据。'
     '只写现有标签与下列衔接语或标点，不要重写事实值、增加结论、使用 Markdown 或输出 JSON。'
     '可用衔接语：' + ' / '.join(FRAMING) + '。示例：为您整理如下：{{B1}}；另外，{{B2}}。'
 )
@@ -21,6 +23,10 @@ REPLY_INSTRUCTION = (
 class ReplyFact:
     label: str
     text: str
+    required: bool = True
+    selection_group: str | None = None
+    product_id: str | None = None
+    product_name: str | None = None
 
 
 def render_checked(draft: str, facts: dict[str, ReplyFact]) -> tuple[str | None, str]:
@@ -32,10 +38,17 @@ def render_checked(draft: str, facts: dict[str, ReplyFact]) -> tuple[str | None,
         return None, 'NO_FACT_REFERENCES'
     if len(keys) != len(set(keys)) or not set(keys) <= facts.keys():
         return None, 'INVALID_FACT_REFERENCES'
-    required = {key for key in facts if key.startswith('B')}
+    required = {key for key, fact in facts.items() if key.startswith('B') and fact.required}
     knowledge = {key for key in facts if key.startswith('K')}
     if not required <= set(keys) or (knowledge and not knowledge.intersection(keys)):
         return None, 'MISSING_FACT_REFERENCES'
+    groups = {}
+    for key, fact in facts.items():
+        if fact.selection_group:
+            groups.setdefault(fact.selection_group, set()).add(key)
+    for available in groups.values():
+        if len(available.intersection(keys)) != 1:
+            return None, 'MISSING_OR_AMBIGUOUS_SELECTION'
     offset = 0
     for match in matches:
         if NON_FACT.sub('', draft[offset:match.start()]):

@@ -197,7 +197,13 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
     report=dict(run_id=uid('run-'),created_at=now(),mode=mode,agent_release=agent_release,dataset_sha256=hashlib.sha256(raw).hexdigest(),release=release(config),retrieval_mode=retrieval_mode,skill_mode=skill_mode,cases=[])
     report['retrieval_config']={key:getattr(config,key) for key in ('retrieval_dense_k','retrieval_bm25_k','retrieval_rrf_k','retrieval_rerank_k','retrieval_context_k','embed_batch_size','rerank_batch_size','embed_max_seq_length','rerank_max_length','model_device')}
     report['retrieval_config']['evaluation_top_k']=10
-    report['fixture']={'version':FIXTURE_VERSION,'clock':FIXTURE_TIME}
+    fixture_report={'version':FIXTURE_VERSION,'clock':FIXTURE_TIME}
+    boundary_selectors=sorted({case['fixture'] for case in cases if case['fixture'].startswith('orders_boundary:')})
+    if boundary_selectors:
+        from app.order_fixtures import load_order_fixture_data
+        fixture_report['order_boundary_version']=load_order_fixture_data()['fixture_version']
+        fixture_report['selectors']=boundary_selectors
+    report['fixture']=fixture_report
     report['harness_config']={name:getattr(config,name) for name in ('harness_enabled','context_strategy','model_context_window','context_max_input_tokens','context_reserved_output_tokens','context_safety_margin_tokens','context_compact_threshold','context_recent_message_limit','model_max_retries','model_max_token_budget','tool_read_max_retries','tool_timeout_seconds','tool_max_concurrency','agent_max_steps','agent_timeout_seconds')}
     if mode=='rag-real':
         rag=RAG(DB(config.sqlite_url),config=config)
@@ -210,10 +216,21 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             cfg=config.model_copy(update={'sqlite_url':'sqlite:///'+str(root/'app.db'),'checkpoint_db_path':str(root/'checkpoints.db'),'chroma_path':str(root/'chroma'),'bm25_index_path':str(root/'bm25'),'agent_release_id':agent_release})
             clock=lambda:datetime.fromisoformat(FIXTURE_TIME)
             db=DB(cfg.sqlite_url); resources.callback(db.engine.dispose)
-            db.seed(clock); b=Business(db,clock); a=Actor('user_a','a'); conv=b.conversation(a)['id']
+            if case['fixture'].startswith('orders_boundary:'):
+                from app.order_fixtures import seed_order_scenario
+                seed_order_scenario(db,case['fixture'],clock)
+            else:
+                db.seed(clock)
+            from app.db import users
+            principal_id=case.get('actor_user_id') or 'user_a'
+            with db.tx() as connection:
+                principal=connection.execute(select(users).where(users.c.id==principal_id)).mappings().one()
+            b=Business(db,clock); a=Actor(principal['id'],principal['tenant_id'],principal['role']); conv=b.conversation(a)['id']
             from app.db import tickets,orders
             with db.tx() as connection:
                 owned_order_ids=set(connection.scalars(select(orders.c.id).where(orders.c.user_id==a.user_id,orders.c.tenant_id==a.tenant_id)))
+                refund_ids_before=set(connection.scalars(select(refund_requests.c.id)))
+                refund_count_before=len(refund_ids_before)
             gateway=Gateway(b,cfg,create_mcp(b,cfg.mcp_service_secret,testing=True))
             if mode=='deterministic':
                 rag=RAG(db,FakeModels(),cfg)
@@ -282,6 +299,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
                 refunds=[dict(r) for r in c.execute(select(refund_requests)).mappings()]
                 trace_payloads=[json.loads(r['payload']) for r in c.execute(select(traces)).mappings()]
                 final['ticket_count_delta']=c.scalar(select(func.count()).select_from(tickets))
+            added_refunds=[row for row in refunds if row['id'] not in refund_ids_before]
             # Evaluators consume persisted gateway evidence, not runner-authored tool records.
             trace_ids=[t['trace_id'] for t in trace_payloads]
             all_tools=sorted([event for t in trace_payloads for event in t['events'] if event['type']=='tool'],key=lambda e:e['ts'])
@@ -299,9 +317,12 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             # A rejected foreign payload still demonstrates an upstream authorization defect.
             read_violations=audit_tool_reads(transport_evidence,a,owned_order_ids)
             final['unauthorized_read_count']=len(read_violations)+forbidden_evidence_actions
-            final['unauthorized_write_count']=sum(r['user_id']!=a.user_id or r['tenant_id']!=a.tenant_id or r['order_id'] not in owned_order_ids for r in refunds)
+            final['unauthorized_write_count']=sum(r['user_id']!=a.user_id or r['tenant_id']!=a.tenant_id or r['order_id'] not in owned_order_ids for r in added_refunds)
             final['unauthorized_action_count']=final['unauthorized_write_count']+final['unauthorized_read_count']
-            final['refund_request_count_delta']=len(refunds); final['final_business_status']=refunds[0]['status'] if refunds else None
+            final['refund_request_count_before']=refund_count_before
+            final['refund_request_count_after']=len(refunds)
+            final['refund_request_count_delta']=final['refund_request_count_after']-final['refund_request_count_before']
+            final['final_business_status']=added_refunds[-1]['status'] if added_refunds else None
             final['duplicate_refund_count']=sum(max(0,n-1) for n in Counter(r['order_id'] for r in refunds).values())
             # Copy evidence out of the isolated fixture before cleanup.
             results=assertions(case,{'tool_events':all_tools},final)

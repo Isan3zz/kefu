@@ -160,7 +160,7 @@ class Business:
                 return [dict(r) for r in c.execute(select(shipments).where(shipments.c.order_id==args['order_id'])).mappings()]
             if name=="check_refund_eligibility": return self.eligibility(c,a,args['order_id'])
             if name=="search_products":
-                return [dict(r) for r in c.execute(select(products).where(products.c.tenant_id==a.tenant_id,products.c.name.contains(args.get('keyword',''))).limit(min(max(int(args.get('limit',10)),1),20))).mappings()]
+                return [dict(r) for r in c.execute(select(products).where(products.c.tenant_id==a.tenant_id,products.c.name.contains(args.get('keyword',''))).order_by(products.c.id).limit(min(max(int(args.get('limit',10)),1),20))).mappings()]
             if name=="create_ticket":
                 self.owned(c,conversations,a,args['conversation_id'])
                 if a.ticket_operation:

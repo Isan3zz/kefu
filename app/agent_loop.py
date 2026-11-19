@@ -108,7 +108,9 @@ class AgentLoop:
         task = {'message':self.text,'active_workflow_id':state.get('active_workflow_id'),
                 'resolved_order_id':self.resolve(state),'available_skills':meta if self.skill_mode != 'none' else []}
         if facts:
-            task['reply_facts'] = {key:{'label':fact.label,'preview':fact.text[:100]} for key,fact in facts.items()}
+            task['reply_facts'] = {key:{'label':fact.label,'preview':fact.text[:240],
+                                        'selection_group':fact.selection_group}
+                                   for key,fact in facts.items()}
         started = time.perf_counter()
         try:
             context = await self.services.context.build_context(
@@ -173,7 +175,10 @@ class AgentLoop:
             return SimpleNamespace(tool_calls=[wire], content='')
         facts = self.reply_facts(state)
         if facts:
-            keys = [key for key in facts if key.startswith('B')] + [key for key in facts if key.startswith('K')][:1]
+            required = [key for key, fact in facts.items() if key.startswith('B') and fact.required]
+            candidate = next((key for key, fact in facts.items()
+                              if fact.selection_group == 'product_candidate'), None)
+            keys = required + ([candidate] if candidate else []) + [key for key in facts if key.startswith('K')][:1]
             draft = ('为您整理如下：' if len(keys)>1 else '') + '；'.join('{{' + key + '}}' for key in keys) + '。'
             return SimpleNamespace(tool_calls=[], content=draft)
         if state['retrieved_chunks']:
@@ -360,6 +365,20 @@ class AgentLoop:
                     and not re.search(r'先.{0,8}(?:看看|查)|能否|能不能|可以.{0,3}退|进度|到账|状态|受理|政策|不(?:要|想|用).{0,6}(?:退|取消)|别.{0,6}退',self.text))
 
     def compact_observation(self, name, data):
+        if name == 'search_products' and self.recommendation:
+            selected = self.agent.memory.revalidate(self.ctx.principal, self.memories)
+            ceiling = budget_for(self.text, selected)
+            candidates = self.recommendation_candidates(data, selected, ceiling)
+            rows = []
+            max_chars = max(self.config.context_tool_result_max_chars, 1500)
+            for item in candidates:
+                entry = {'id':item['id'], 'price_cents':item['price_cents'], 'stock':item['stock'],
+                         'summary':self.display_product(item)}
+                wire = json.dumps({'ok':True,'data':rows+[entry],'truncated':True},ensure_ascii=False)
+                if len(wire.encode()) > max_chars:
+                    break
+                rows.append(entry)
+            return json.dumps({'ok':True,'data':rows,'truncated':len(rows) < len(data)},ensure_ascii=False)
         keys = {'id','order_id','status','price_cents','stock','name','chunk_id','document_title','version','eligible','reason_code'}
         values = data if isinstance(data,list) else [data]
         rows = []
@@ -370,6 +389,52 @@ class AgentLoop:
                     break
                 rows.append(entry)
         return json.dumps({'ok':True,'data':clean(rows),'truncated':True},ensure_ascii=False)
+
+    @staticmethod
+    def profile_match_score(item, memories):
+        if not memories:
+            return 0
+        text = ' '.join(memory.content for memory in memories).lower()
+        try:
+            attrs = json.loads(item.get('attributes_json') or '{}')
+        except (TypeError, ValueError):
+            attrs = {}
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        score = 0
+        form = str(attrs.get('form_factor') or '')
+        if re.search(r'头戴|耳罩', text):
+            score += 5 if '头戴' in form or '耳罩' in form else -5
+        if re.search(r'(?:不.{0,4}接受|不.{0,4}喜欢|避免).{0,5}入耳', text):
+            score += 4 if '入耳' not in form else -4
+        if re.search(r'主动降噪|降噪|\banc\b', text):
+            score += 3 if attrs.get('active_noise_cancellation') is True else -2
+        if re.search(r'双设备|同时连接|多设备', text):
+            score += 3 if attrs.get('multipoint') is True else -2
+        if re.search(r'通话|麦克风|视频会议', text):
+            score += 3 if attrs.get('call_noise_reduction') is True else -2
+        if re.search(r'办公室|办公|视频会议', text):
+            scenarios = attrs.get('usage_scenarios')
+            scenario_text = ' '.join(scenarios) if isinstance(scenarios, list) else ''
+            score += 2 if any(term in scenario_text for term in ('办公', '会议', '远程')) else -1
+        return score
+
+    def recommendation_candidates(self, rows, memories, ceiling):
+        unique = {}
+        for item in rows:
+            if item.get('stock', 0) <= 0 or (ceiling is not None and item.get('price_cents', 0) > ceiling):
+                continue
+            if item.get('category') not in (None, 'headphones'):
+                continue
+            unique[item['id']] = item
+        candidates = list(unique.values())
+        if memories and candidates:
+            scores = {item['id']: self.profile_match_score(item, memories) for item in candidates}
+            best = max(scores.values())
+            if best > 0:
+                candidates = [item for item in candidates if scores[item['id']] == best]
+        return candidates[:8]
 
     def set_label(self, name, skill, progress):
         self.select_skill(skill, progress)
@@ -385,17 +450,46 @@ class AgentLoop:
     def reply_facts(self, state):
         facts = {}
         tools = state['loop_observations']
+        product_rows = []
+        product_searched = False
         labels = {'get_orders':'本人订单列表','get_order':'订单详情','track_shipment':'物流',
                   'search_products':'实时商品','create_ticket':'人工工单','begin_refund_workflow':'退款资格',
                   'check_refund_eligibility':'退款资格'}
         for tool in tools:
             name, result = tool['name'], tool['result']
+            if name == 'search_products' and self.recommendation and result['ok']:
+                product_searched = True
+                product_rows.extend(result['data'])
+                continue
             if name not in labels or not result['ok'] or (name=='begin_refund_workflow' and state['pending_confirmation']):
                 continue
             if name=='begin_refund_workflow' and any(prior['name']=='check_refund_eligibility' and prior['result']['ok']
                     and prior['args']==tool['args'] and prior['result']['data']==result['data'] for prior in tools):
                 continue
             facts[f'B{len(facts)+1}'] = ReplyFact(labels[name], self.display_business(name,result['data'],tool['args'],state['loop_memory_ids']))
+        if product_searched:
+            selected = self.agent.memory.revalidate(
+                self.ctx.principal,
+                [item for item in self.memories if item.memory_id in state['loop_memory_ids']],
+            )
+            ceiling = budget_for(self.text, selected)
+            candidates = self.recommendation_candidates(product_rows, selected, ceiling)
+            if selected:
+                preference = selected[0].content.strip()
+                if preference:
+                    facts[f'B{len(facts)+1}'] = ReplyFact(
+                        '相关用户偏好', '参考你保存的偏好：' + preference[:120],
+                    )
+            if candidates:
+                for item in candidates:
+                    facts[f'B{len(facts)+1}'] = ReplyFact(
+                        '商品候选', '实时商品信息：' + self.display_product(item), required=False,
+                        selection_group='product_candidate', product_id=item['id'], product_name=item['name'],
+                    )
+            else:
+                text = ('没有找到预算内的有库存商品。' if ceiling is not None
+                        else '当前目录中没有找到有库存的推荐商品。')
+                facts[f'B{len(facts)+1}'] = ReplyFact('商品查询结果', text)
         if facts:
             for number, row in enumerate(state['retrieved_chunks'], 1):
                 facts[f'K{number}'] = ReplyFact('知识证据',
@@ -454,6 +548,21 @@ class AgentLoop:
         except (TypeError, ValueError):
             return summary
         if isinstance(attrs, dict):
+            form = attrs.get('form_factor')
+            if isinstance(form, str) and form:
+                summary += f'；佩戴形式：{form}'
+            for key, label in (('active_noise_cancellation', '主动降噪'),
+                               ('call_noise_reduction', '通话降噪'),
+                               ('multipoint', '双设备连接')):
+                value = attrs.get(key)
+                if type(value) is bool:
+                    summary += f'；{label}：{"支持" if value else "不支持"}'
+            scenarios = attrs.get('usage_scenarios')
+            if isinstance(scenarios, list) and scenarios and all(isinstance(value, str) for value in scenarios):
+                summary += '；适用场景：' + '、'.join(scenarios[:3])
+            features = attrs.get('features')
+            if isinstance(features, list) and features and all(isinstance(value, str) for value in features):
+                summary += '；特点：' + '、'.join(features[:3])
             colors = attrs.get('colors')
             if isinstance(colors, list) and colors and all(isinstance(color, str) for color in colors):
                 summary += '，颜色：' + '、'.join(colors)
@@ -479,14 +588,45 @@ class AgentLoop:
             parts=[]
             if facts:
                 rendered, validation = render_checked(draft, facts)
+                selected_products = []
+                selection_source = 'model_fact_selection'
                 if rendered:
                     parts.append(rendered)
+                    selected_products = [facts[match.group(1)].product_id for match in FACT_MARKER.finditer(draft)
+                                         if match.group(1) in facts and facts[match.group(1)].selection_group == 'product_candidate']
                 else:
-                    parts.extend(fact.text.rstrip('。')+'。' for key,fact in facts.items() if key.startswith('B'))
+                    required_facts = [fact.text.rstrip('。')+'。' for key,fact in facts.items()
+                                      if key.startswith('B') and fact.required]
+                    product_candidates = [(key, fact) for key, fact in facts.items()
+                                          if key.startswith('B') and fact.selection_group == 'product_candidate']
+                    requested = next((facts[match.group(1)] for match in FACT_MARKER.finditer(draft)
+                                      if match.group(1) in facts and facts[match.group(1)].selection_group == 'product_candidate'), None)
+                    if product_candidates and requested is None:
+                        mentioned = [(key, fact) for key, fact in product_candidates
+                                     if fact.product_name and fact.product_name in draft]
+                        if len(mentioned) == 1:
+                            requested = mentioned[0][1]
+                            selection_source = 'model_answer_product_name'
+                        elif len(product_candidates) == 1:
+                            requested = product_candidates[0][1]
+                            selection_source = 'single_verified_candidate'
+                    if product_candidates and requested is None:
+                        parts.append('已查询到在售商品。请补充你更看重的佩戴形式、降噪或设备连接需求。')
+                    else:
+                        parts.extend(required_facts)
+                        if requested is not None:
+                            parts.append(requested.text.rstrip('。')+'。')
+                            if requested.product_id:
+                                selected_products = [requested.product_id]
+                                if selection_source == 'model_fact_selection':
+                                    selection_source = 'verified_fact_fallback'
                     if citations:
                         parts.insert(0,self.display_knowledge(citations.values()))
                 self.emit('reply_composed',mode='MODEL_TEMPLATE' if rendered else 'VERIFIED_FALLBACK',
                           validation=validation,fact_count=len(facts))
+                if selected_products:
+                    self.emit('product_recommendation', product_ids=selected_products,
+                              source=selection_source, memory_ids=state['loop_memory_ids'])
                 latest = {message.name:message.status for message in history if isinstance(message,ToolMessage)}
                 if reason!='LIMIT' and any(status=='error' for name,status in latest.items() if name!='load_skill'):
                     parts.append('另有查询结果未能确认，请核对信息后重试。')
