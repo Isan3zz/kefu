@@ -66,7 +66,7 @@ async def test_jsonl_failure_preserves_sqlite_and_accepted_result(env,monkeypatc
     record=payloads(env)[0]
     assert record['storage_errors'][0]['backend']=='jsonl'
     assert record['business_outcome']=='REQUEST_ACCEPTED'
-    assert [e for e in record['events'] if e['type']=='tool'][0]['result']['data']['status']=='ACCEPTED'
+    assert [e for e in record['events'] if e['type']=='workflow.commit.completed'][0]['receipt']['status']=='ACCEPTED'
 
 def test_redaction_keeps_usage_metrics():
     value=clean({'Authorization':'Bearer raw','api_key':'secret','confirm_nonce':'nonce','summary':'private','usage':{'prompt_tokens':123,'completion_tokens':45},'estimated_tokens':20})

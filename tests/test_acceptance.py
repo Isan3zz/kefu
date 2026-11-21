@@ -5,7 +5,6 @@ from pathlib import Path
 from datetime import datetime,timezone,timedelta
 import pytest
 from sqlalchemy import select,func
-from fastmcp import Client
 from app.business import DomainError,Actor
 from app.db import *
 from app.agent import Agent
@@ -45,14 +44,22 @@ async def test_T05_changed_order(env):
     assert count(env)==0
 
 async def test_T06_timeout_committed(env,monkeypatch):
-    p=preview(env); env['b'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
-    original=Client.call_tool
-    async def timeout(self,name,args,*a,**kw):
-        await original(self,name,args,*a,**kw)
-        raise TimeoutError('simulated lost response AFTER actual MCP commit')
-    monkeypatch.setattr(Client,'call_tool',timeout)
-    result=await env['gateway'].call(env['a'],'submit_refund_request',{'workflow_id':p['workflow_id']},trusted_workflow=True)
-    assert result['ok'] and result['data']['idempotent_replay'] and count(env)==1
+    p=preview(env)
+    original=env['b'].submit
+    writes=0
+
+    def lose_result(actor,wid):
+        nonlocal writes
+        original(actor,wid)
+        writes+=1
+        raise TimeoutError('submission result lost after commit')
+
+    monkeypatch.setattr(env['b'],'submit',lose_result)
+    first=await env['agent'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
+    replay=await env['agent'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
+    assert first['refund_workflow_result']['status']=='VERIFIED_SUCCESS'
+    assert first['refund_request_id']==replay['refund_request_id']
+    assert writes==1 and count(env)==1
 
 async def test_T07_unrelated_question(env):
     r=await env['agent'].chat(env['a'],env['conv'],'退订单 O1001','deterministic'); p=r['pending_confirmation']

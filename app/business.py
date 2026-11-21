@@ -18,6 +18,7 @@ class Actor:
     tenant_id: str
     role: str = "customer"
     ticket_operation: str | None = None
+    refund_preview_scope: tuple[str, str] | None = None
 
 
 PriceCents = Annotated[int, Field(strict=True, ge=0, le=(1 << 63) - 1)]
@@ -78,9 +79,15 @@ class Business:
     def preview(self,a,conv,oid,*,reuse_pending=False,invocation_id=None):
         with self.db.tx() as c:
             self.owned(c,conversations,a,conv)
+            o=self.owned(c,orders,a,oid)
+            if reuse_pending:
+                prior=self._refund_workflow_for_order(c,a,oid)
+                if prior:
+                    if prior['conversation_id']==conv:
+                        self._link_preview(c,a,conv,invocation_id,prior['id'])
+                    return dict(workflow_id=prior['id'],order_id=oid,status=prior['status'])
             e=self.eligibility(c,a,oid)
             if not e['eligible']: raise DomainError("BUSINESS_RULE_FAILED",e['reason_code'])
-            o=self.owned(c,orders,a,oid)
             if reuse_pending:
                 prior=c.execute(select(workflow_instances).where(
                     workflow_instances.c.tenant_id==a.tenant_id,workflow_instances.c.user_id==a.user_id,
@@ -124,34 +131,115 @@ class Business:
     def confirm(self,a,wid,nonce):
         with self.db.tx() as c:
             w=self.owned(c,workflow_instances,a,wid)
-            if not hmac.compare_digest(w['confirm_nonce_hash'],digest(nonce)): raise DomainError("FORBIDDEN")
-            if w['status'] in ("CONFIRMED","REQUEST_ACCEPTED"): return w
+            self._check_refund_nonce(w,nonce)
+            if w['status'] in ("CONFIRMED","SUBMITTING","REQUEST_ACCEPTED","FAILED"): return w
             if w['status']!="WAITING_CONFIRMATION" or datetime.fromisoformat(w['nonce_expires_at'])<=self.clock(): raise DomainError("BUSINESS_RULE_FAILED","确认已失效")
             self._validate_preview(c,a,w)
             c.execute(workflow_instances.update().where(workflow_instances.c.id==wid,workflow_instances.c.status=="WAITING_CONFIRMATION").values(status="CONFIRMED",version=w['version']+1,updated_at=now()))
             w['status']="CONFIRMED"
             return w
+    def check_refund_nonce(self,a,wid,nonce):
+        with self.db.tx() as c:
+            self._check_refund_nonce(self.owned(c,workflow_instances,a,wid),nonce)
+    @staticmethod
+    def _check_refund_nonce(w,nonce):
+        if w['type']!='refund' or not hmac.compare_digest(w['confirm_nonce_hash'],digest(nonce)):
+            raise DomainError("FORBIDDEN")
+    def _refund_workflow_for_order(self,c,a,oid):
+        recorded=select(refund_requests.c.id).where(
+            refund_requests.c.idempotency_key==workflow_instances.c.operation_key).exists()
+        return c.execute(select(workflow_instances).where(
+            workflow_instances.c.tenant_id==a.tenant_id,workflow_instances.c.user_id==a.user_id,
+            workflow_instances.c.order_id==oid,workflow_instances.c.type=='refund',
+            workflow_instances.c.status.in_(('CONFIRMED','SUBMITTING','REQUEST_ACCEPTED')) | recorded,
+        ).order_by((workflow_instances.c.status=='REQUEST_ACCEPTED').desc(),
+                   (workflow_instances.c.status=='SUBMITTING').desc(),
+                   workflow_instances.c.updated_at.desc())).mappings().first()
+    def refund_status_for_order(self,a,oid):
+        with self.db.tx() as c:
+            self.owned(c,orders,a,oid)
+            workflow=self._refund_workflow_for_order(c,a,oid)
+            if workflow:
+                return dict(workflow),None
+            # Imported legacy receipts have no workflow to reconcile.
+            linked=select(workflow_instances.c.id).where(
+                workflow_instances.c.operation_key==refund_requests.c.idempotency_key).exists()
+            receipt=c.execute(select(refund_requests.c.id.label('refund_request_id'),refund_requests.c.status,
+                                     refund_requests.c.amount_cents,refund_requests.c.created_at).where(
+                refund_requests.c.order_id==oid,refund_requests.c.user_id==a.user_id,
+                refund_requests.c.tenant_id==a.tenant_id,~linked)).mappings().first()
+            return None,dict(receipt) if receipt else None
+    def claim_refund_submission(self,a,wid,*,conversation_id=None,graph_thread_id=None):
+        with self.db.tx() as c:
+            w=self.owned(c,workflow_instances,a,wid)
+            self.owned(c,orders,a,w['order_id'])
+            if w['type']!='refund' or w['operation_key']!=wid+':refund':
+                raise DomainError('FORBIDDEN')
+            if (conversation_id is not None and w['conversation_id']!=conversation_id
+                    or graph_thread_id is not None and w['graph_thread_id']!=graph_thread_id):
+                raise DomainError('FORBIDDEN')
+            if w['status']!='CONFIRMED':
+                return False
+            prior=self._refund_workflow_for_order(c,a,w['order_id'])
+            if prior and prior['id']!=wid and prior['status'] in ('SUBMITTING','REQUEST_ACCEPTED'):
+                return False
+            legacy_attempt=c.execute(select(agent_invocations.c.invocation_id).where(
+                agent_invocations.c.graph_thread_id==w['graph_thread_id'],
+                agent_invocations.c.workflow_id==wid,agent_invocations.c.write_started==1,
+                agent_invocations.c.tenant_id==a.tenant_id,agent_invocations.c.user_id==a.user_id,
+            ).limit(1)).first()
+            if legacy_attempt:
+                return False
+            c.execute(workflow_instances.update().where(workflow_instances.c.id==wid).values(
+                status='SUBMITTING',version=w['version']+1,updated_at=now()))
+            return True
     def _validate_preview(self,c,a,w):
         e=self.eligibility(c,a,w['order_id']); o=self.owned(c,orders,a,w['order_id'])
         if not e['eligible'] or e['amount_cents']!=w['amount_cents'] or o['version']!=w['order_version'] or w['policy_version']!=self.policy:
             raise DomainError("BUSINESS_RULE_FAILED","订单或资格已变化，请重新申请预览")
     def submit(self,a,wid):
+        rejection=None
         with self.db.tx() as c:
             w=self.owned(c,workflow_instances,a,wid)
+            if w['type']!='refund' or w['operation_key']!=wid+':refund':
+                raise DomainError('FORBIDDEN')
             old=c.execute(select(refund_requests).where(refund_requests.c.idempotency_key==w['operation_key'])).mappings().first()
             if old: return dict(refund_request_id=old['id'],status=old['status'],idempotent_replay=True)
-            if w['status']!="CONFIRMED": raise DomainError("FORBIDDEN","退款尚未确认")
-            self._validate_preview(c,a,w)
-            rid=uid("refund-")
-            c.execute(refund_requests.insert().values(id=rid,tenant_id=a.tenant_id,user_id=a.user_id,order_id=w['order_id'],amount_cents=w['amount_cents'],status="ACCEPTED",idempotency_key=w['operation_key'],policy_version=self.policy,created_at=now()))
-            c.execute(workflow_instances.update().where(workflow_instances.c.id==wid).values(status="REQUEST_ACCEPTED",updated_at=now(),version=w['version']+1))
-            return dict(refund_request_id=rid,status="ACCEPTED",idempotent_replay=False)
-    def refund_outcome(self,a,wid):
+            if w['status'] not in ('CONFIRMED','SUBMITTING'): raise DomainError("FORBIDDEN","退款尚未确认")
+            try:
+                self._validate_preview(c,a,w)
+            except DomainError as error:
+                if error.code!='BUSINESS_RULE_FAILED':
+                    raise
+                rejection=error
+                c.execute(workflow_instances.update().where(workflow_instances.c.id==wid).values(
+                    status='FAILED',updated_at=now(),version=w['version']+1))
+            else:
+                rid=uid("refund-")
+                c.execute(refund_requests.insert().values(id=rid,tenant_id=a.tenant_id,user_id=a.user_id,order_id=w['order_id'],amount_cents=w['amount_cents'],status="ACCEPTED",idempotency_key=w['operation_key'],policy_version=self.policy,created_at=now()))
+                c.execute(workflow_instances.update().where(workflow_instances.c.id==wid).values(status="REQUEST_ACCEPTED",updated_at=now(),version=w['version']+1))
+                return dict(refund_request_id=rid,status="ACCEPTED",idempotent_replay=False)
+        raise rejection
+    def refund_outcome(self,a,wid,*,order_id=None):
+        """Read the outcome by the original operation, including a persisted rejection."""
         with self.db.tx() as c:
             w=self.owned(c,workflow_instances,a,wid)
-            row=c.execute(select(refund_requests).where(refund_requests.c.idempotency_key==w['operation_key'],refund_requests.c.tenant_id==a.tenant_id,refund_requests.c.user_id==a.user_id,refund_requests.c.order_id==w['order_id'])).mappings().first()
-            if not row or w['status']!='REQUEST_ACCEPTED' or row['status']!='ACCEPTED' or row['amount_cents']!=w['amount_cents'] or row['policy_version']!=w['policy_version']: return None
-            return dict(refund_request_id=row['id'],status=row['status'],idempotent_replay=True)
+            self.owned(c,orders,a,w['order_id'])
+            if w['type']!='refund' or w['operation_key']!=wid+':refund' or (order_id is not None and w['order_id']!=order_id):
+                return None
+            row=c.execute(select(refund_requests).where(refund_requests.c.idempotency_key==w['operation_key'])).mappings().first()
+            if row is None:
+                if w['status']=='FAILED':
+                    return dict(status='REJECTED')
+                return None
+            if (not row['id'] or row['tenant_id']!=a.tenant_id or row['user_id']!=a.user_id or row['order_id']!=w['order_id']
+                    or type(row['amount_cents']) is not int or row['amount_cents']<=0
+                    or row['amount_cents']!=w['amount_cents'] or row['policy_version']!=w['policy_version']):
+                return None
+            if (w['status'],row['status']) not in (('REQUEST_ACCEPTED','ACCEPTED'),('FAILED','REJECTED')):
+                return None
+            return dict(refund_request_id=row['id'],status=row['status'],amount_cents=row['amount_cents'],
+                        created_at=row['created_at'])
     def cancel(self,a,wid):
         with self.db.tx() as c:
             w=self.owned(c,workflow_instances,a,wid)
@@ -167,7 +255,16 @@ class Business:
             tickets.c.user_id==a.user_id,tickets.c.conversation_id==conv)).first()
         return dict(ticket_id=tid,status=row.status) if row else None
     def tool(self,a,name,args):
-        if name=="submit_refund_request": return self.submit(a,args['workflow_id'])
+        if name=='begin_refund_workflow':
+            if not a.refund_preview_scope:
+                raise DomainError('FORBIDDEN', '退款预览需要受信任的会话与执行上下文')
+            conversation_id,invocation_id=a.refund_preview_scope
+            try:
+                return self.preview(a,conversation_id,args['order_id'],reuse_pending=True,invocation_id=invocation_id)
+            except DomainError as error:
+                if error.code!='BUSINESS_RULE_FAILED':
+                    raise
+                return dict(workflow_id=None,order_id=args['order_id'],status='FAILED',reason_code=error.message)
         with self.db.tx() as c:
             if name=="get_orders":
                 return [dict(r) for r in c.execute(select(orders).where(orders.c.tenant_id==a.tenant_id,orders.c.user_id==a.user_id).order_by(orders.c.paid_at.desc(),orders.c.id).limit(max(1,min(int(args.get('limit',10)),20)))).mappings()]

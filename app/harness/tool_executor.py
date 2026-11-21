@@ -5,7 +5,7 @@ from app.db import uid
 from app.mcp import ToolResponse
 from app.harness.contracts import HarnessFailure,ToolExecutionResult
 from app.harness.policy_guard import READ_TOOLS
-from app.harness.recovery import backoff,reconcile_refund
+from app.harness.recovery import backoff
 from pydantic import BaseModel,ConfigDict,StrictBool,StrictInt,StrictStr
 
 class Payload(BaseModel): model_config=ConfigDict(extra='allow',strict=True)
@@ -18,11 +18,17 @@ class OwnedOrder(Payload):
 class Shipment(Payload): order_id:StrictStr; status:StrictStr
 class Product(Payload): id:StrictStr; stock:StrictInt; price_cents:StrictInt
 class Eligibility(Payload): eligible:StrictBool; reason_code:StrictStr; amount_cents:StrictInt; policy_version:StrictStr; requires_human:StrictBool
-class RefundReceipt(Payload): refund_request_id:StrictStr; status:StrictStr; idempotent_replay:StrictBool
+class RefundPreview(Payload):
+    workflow_id:StrictStr|None
+    order_id:StrictStr
+    status:StrictStr
+    amount_cents:StrictInt|None=None
+    confirm_nonce:StrictStr|None=None
+    reason_code:StrictStr|None=None
 class TicketReceipt(Payload): ticket_id:StrictStr; status:StrictStr
 
 def validate_payload(name,data,ctx,args):
-    schema={'get_orders':OwnedOrder,'get_order':OwnedOrder,'track_shipment':Shipment,'search_products':Product,'check_refund_eligibility':Eligibility,'submit_refund_request':RefundReceipt,'create_ticket':TicketReceipt}[name]
+    schema={'get_orders':OwnedOrder,'get_order':OwnedOrder,'track_shipment':Shipment,'search_products':Product,'check_refund_eligibility':Eligibility,'begin_refund_workflow':RefundPreview,'create_ticket':TicketReceipt}[name]
     if name in ('get_orders','track_shipment','search_products'):
         if not isinstance(data,list): raise ValueError('Tool result must be a list')
         for item in data: schema.model_validate(item)
@@ -33,6 +39,7 @@ def validate_payload(name,data,ctx,args):
     if name=='search_products' and any(item.get('tenant_id')!=ctx.principal.tenant_id for item in data): raise HarnessFailure('FORBIDDEN','工具返回商品不在当前租户范围',source='tool')
     if name=='get_order' and data['id']!=args['order_id']: raise ValueError('Order scope mismatch')
     if name=='track_shipment' and any(item['order_id']!=args['order_id'] for item in data): raise ValueError('Shipment scope mismatch')
+    if name=='begin_refund_workflow' and data['order_id']!=args['order_id']: raise ValueError('Refund order scope mismatch')
 
 class ToolExecutor:
     def __init__(self,gateway,guard,config,controller):
@@ -45,13 +52,10 @@ class ToolExecutor:
         start=time.perf_counter(); operation=uid('op-')
         args=self.guard.check(ctx,budget,telemetry,None,tool_name,arguments,internal=True)
         budget.tool_calls+=1; budget.tool_attempts+=1
-        telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=tool_name,risk_class='preview' if tool_name=='begin_refund_workflow' else 'read')
+        telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=tool_name,risk_class='read')
         try:
-            if tool_name=='begin_refund_workflow':
+            async with asyncio.timeout(min(self.config.tool_timeout_seconds,ctx.remaining())):
                 data=await handler(args)
-            else:
-                async with asyncio.timeout(min(self.config.tool_timeout_seconds,ctx.remaining())):
-                    data=await handler(args)
             outcome=dict(ok=True,data=data,outcome='SUCCESS')
         except DomainError as error:
             outcome=dict(ok=False,error={'code':error.code,'message':error.message},outcome='KNOWN_FAILURE')
@@ -59,8 +63,6 @@ class ToolExecutor:
             outcome=dict(ok=False,error={'code':'TOOL_TIMEOUT','message':'本地工具超时'},outcome='KNOWN_FAILURE')
         return self.record_result(ToolExecutionResult(tool_name=tool_name,request_id=operation, attempts=1,
                                   latency_ms=(time.perf_counter()-start)*1000,**outcome),args,operation)
-    async def execute_refund_from_workflow(self,*,ctx,workflow_id,budget,telemetry):
-        return await self._invoke(ctx,None,'submit_refund_request',{'workflow_id':workflow_id},budget,telemetry,self.guard)
     def record_result(self,result,args,operation):
         from app.observability import emit
         observed=result.envelope()
@@ -68,24 +70,30 @@ class ToolExecutor:
             observed['data']={key:value for key,value in result.data.items() if key!='guidance'}
         emit('tool',layer='harness',name=result.tool_name,args=args,operation_id=operation,request_id=result.request_id,result=observed,ok=result.ok,status='success' if result.ok else 'error',error_code=result.error['code'] if result.error else None,attempts=result.attempts,outcome=result.outcome,duration_ms=result.latency_ms)
         return result
-    async def _invoke(self,ctx,skill_name,name,args,budget,telemetry,capability=None,proposal_id=None):
+    async def _invoke(self,ctx,skill_name,name,args,budget,telemetry,proposal_id=None):
         start=time.perf_counter(); operation=uid('op-'); attempt=0
-        args=self.guard.check(ctx,budget,telemetry,skill_name,name,args,workflow_capability=capability)
+        args=self.guard.check(ctx,budget,telemetry,skill_name,name,args)
         budget.tool_calls+=1
         write=name not in READ_TOOLS
         if proposal_id is not None:
-            telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=name,risk_class='write' if write else 'read')
+            telemetry.emit('loop.tool_allowed',tool_call_id=proposal_id,name=name,
+                           risk_class='preview' if name=='begin_refund_workflow' else 'write' if write else 'read')
         telemetry.emit('tool.started',tool_name=name,operation_id=operation)
         while True:
             ctx.remaining(); attempt+=1; budget.tool_attempts+=1
             try:
-                timeout=min(self.config.tool_timeout_seconds,ctx.remaining())
                 async def perform():
                     try:
                         async with self.semaphore:
                             actual_timeout=min(self.config.tool_timeout_seconds,ctx.remaining())
                             async with asyncio.timeout(actual_timeout):
-                                raw=await self.gateway.call(ctx.principal,name,args,skill_name,capability is self.guard,single_attempt=True,timeout=actual_timeout,operation_id=operation,attempt_no=attempt,**({'ticket_operation':ctx.invocation_id} if name=='create_ticket' else {}))
+                                scope={}
+                                if name=='create_ticket':
+                                    scope['ticket_operation']=ctx.invocation_id
+                                elif name=='begin_refund_workflow':
+                                    scope['refund_preview_scope']=(ctx.conversation_id,ctx.invocation_id)
+                                raw=await self.gateway.call(ctx.principal,name,args,skill_name,single_attempt=True,
+                                                            timeout=actual_timeout,operation_id=operation,attempt_no=attempt,**scope)
                                 result=ToolResponse.model_validate(raw,strict=True).model_dump(mode='json')
                                 if result['ok']: validate_payload(name,result['data'],ctx,args)
                                 return result
@@ -98,10 +106,6 @@ class ToolExecutor:
                     task=self.controller.retain(asyncio.create_task(perform()))
                     raw=await asyncio.shield(task)
                 else: raw=await perform()
-                if name=='submit_refund_request' and raw['ok']:
-                    actual=self.gateway.business.refund_outcome(ctx.principal,args['workflow_id'])
-                    if actual is None: raise HarnessFailure('UNKNOWN_OUTCOME','申请状态暂未确认，请查询原操作状态',source='tool')
-                    if not isinstance(raw['data'],dict) or any(raw['data'].get(k)!=actual[k] for k in ('refund_request_id','status')): raw['data']=actual
                 outcome='SUCCESS' if raw['ok'] else 'UNKNOWN_OUTCOME' if raw['error']['code']=='UNKNOWN_OUTCOME' else 'KNOWN_FAILURE'
                 result=ToolExecutionResult(tool_name=name,**raw,attempts=attempt,latency_ms=(time.perf_counter()-start)*1000,outcome=outcome)
                 telemetry.emit('tool.completed' if result.ok else 'tool.failed',tool_name=name,request_id=result.request_id,operation_id=operation,attempts=attempt,attempt_no=attempt,outcome=outcome,error_code=result.error['code'] if result.error else None,status='success' if result.ok else 'error',duration_ms=result.latency_ms)
@@ -112,11 +116,6 @@ class ToolExecutor:
             except Exception as exc:
                 code=exc.code if isinstance(exc,DomainError) else 'TOOL_BAD_RESULT' if isinstance(exc,(ValueError,TypeError,ValidationError)) else 'TOOL_TIMEOUT' if isinstance(exc,TimeoutError) else 'TOOL_UPSTREAM_ERROR'
                 if write and code not in ('FORBIDDEN','BUSINESS_RULE_FAILED','INVALID_ARGUMENT','ALREADY_EXISTS','POLICY_DENIED'):
-                    actual=reconcile_refund(self.gateway.business,ctx,args['workflow_id'],telemetry) if name=='submit_refund_request' else None
-                    if actual:
-                        result=ToolExecutionResult(tool_name=name,ok=True,data=actual,request_id=operation,attempts=attempt,latency_ms=(time.perf_counter()-start)*1000,outcome='SUCCESS')
-                        telemetry.emit('tool.completed',tool_name=name,request_id=operation,operation_id=operation,attempts=attempt,outcome='SUCCESS',reconciled=True,duration_ms=result.latency_ms)
-                        return self.record_result(result,args,operation)
                     code='UNKNOWN_OUTCOME'
                 telemetry.emit('tool.failed',tool_name=name,operation_id=operation,attempt_no=attempt,attempts=attempt,error_code=code,status='error',outcome='UNKNOWN_OUTCOME' if code=='UNKNOWN_OUTCOME' else 'KNOWN_FAILURE')
                 if not write and code in ('TOOL_TIMEOUT','TOOL_UPSTREAM_ERROR','UPSTREAM_UNAVAILABLE') and attempt<=self.config.tool_read_max_retries:

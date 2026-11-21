@@ -1,6 +1,6 @@
 # 架构与边界
 
-一个 FastAPI 进程提供 REST / SSE，一个 loopback FastMCP 进程提供七个真实工具。SQLite 是业务权威，LangGraph 的异步 SQLite saver 是执行进度，不是订单真相。
+一个 FastAPI 进程提供 REST / SSE，一个 loopback FastMCP 进程提供七个供主 Agent 调用的工具。SQLite 保存权威业务状态，LangGraph 的异步 SQLite saver 保存执行进度。
 
 Agent Harness 增量层已接入：API → HarnessFacade/RunController → 原 LangGraph；节点使用注入的 ModelGateway、ToolExecutor、ContextManager、PolicyGuard 与 Telemetry。原 MCP Gateway 继续负责协议和 HMAC，原 Business 保留所有最终授权和事务，原 Recorder 是唯一 Trace 出口。Invocation 与图进度/业务 workflow 是三个不同状态。按图线程锁替代原全局锁，不同会话可并发；单 worker 限制明确保留。
 
@@ -23,9 +23,9 @@ flowchart LR
 
 业务回复分三步：后端从已核验的工具结果生成编号事实，现有 Loop 的最后一轮模型用事实标签组织自然语言，服务端核对标签完整性和衔接语后填入真实事实。未知、重复或遗漏的标签以及未经核实的断言都会触发确定性回退，不增加模型调用。知识库单独回答保留原引用校验；复合回答可用知识事实标签插入带来源的证据。待确认退款仍由工作流直接输出预览。
 
-每个会话 thread 为 conv:<id>，退款 thread 为 wf:<id>。退款预览事务保存订单、金额、policy version、order version、nonce hash、稳定 operation key。等待节点 interrupt 不执行写入；confirm 先事务确认身份、有效期及预览，然后 Command(resume)；独立 commit 节点再次检查业务资格。退款记录与 workflow 终态在同一事务提交，唯一订单与幂等键防止并发重复退款。未知写入结果按原 operation key 查单，不创建新键重试。
+每个会话使用 `conv:<id>` 线程，退款使用 `wf:<id>` 线程。主 Agent 调用 MCP `begin_refund_workflow`，Gateway 在签名请求头中绑定当前会话与 Invocation。Business 在同一事务保存预览并关联 Invocation，API 将确认中断持久化到独立线程后返回预览。
 
-提交工具返回后还须核对 SQLite 中同一 workflow 的实际受理回执，空口成功不能完成图。已受理的重复确认直接读原业务结果，不依赖 MCP 可用。受理回执作为助手消息归档一次；退款进度通过 get_order 返回的本人 refund_request 查询，不能把进度问题当成新申请。会话恢复最近消息、订单列表和商品指代，工单包含相关问题摘要。
+确认接口校验身份、凭据和预览后恢复图。Commit 节点直接调用 `Business.submit()`，事务内重新检查业务资格并按原幂等键写入退款申请。Verify 节点独立调用 `Business.refund_outcome()`。确认、重复确认和核验均可在 MCP 服务离线时完成。Trace 区分 MCP 工具调用与 Workflow 内部提交，受理回执作为助手消息归档一次。
 
 API token 是随机高熵值，仅保存 hash。Gateway 逐次签名 actor context，通过 HTTP header 传输；工具 Schema 不含 actor 或密钥。MCP 校验 HMAC、aud、exp 和用户租户匹配，业务读取再次限定 tenant_id + user_id。退款提交不在模型白名单。Skill 正文不影响授权。
 

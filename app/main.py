@@ -40,6 +40,7 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
         if e.code=='MODEL_TOOL_CALLING_UNSUPPORTED': status=503
         detail={'code':e.code,'message':e.message}
         if getattr(e,'invocation_id',None): detail.update(invocation_id=e.invocation_id,trace_id=e.trace_id)
+        if getattr(e,'workflow_result',None): detail['refund_workflow_result']=e.workflow_result
         return JSONResponse(status_code=status,content=dict(code=e.code,data=None,error=detail,request_id=uid('req-')))
     @app.exception_handler(RequestValidationError)
     async def invalid_argument(request,e):
@@ -112,14 +113,22 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
                                                                          image_ids=body.image_ids,allow_external_image_send=body.allow_external_image_send),
                                  media_type='text/event-stream')
     @app.get('/api/v1/workflows/{wid}')
-    def workflow(wid:str,a=Depends(actor)): return envelope(b.workflow(a,wid))
+    def workflow(wid:str,a=Depends(actor)):
+        from dataclasses import asdict
+
+        state=b.workflow(a,wid)
+        return envelope(dict(state,refund_workflow_result=asdict(agent.refunds.read_result(a,state))))
     class Confirm(Input):
         confirm_nonce:str
         request_id:str|None=Field(default=None,min_length=1,max_length=200)
     @app.post('/api/v1/workflows/{wid}/confirm')
     async def confirm(wid:str,body:Confirm,a=Depends(actor)):
         result=await agent.harness.resume_workflow(principal=a,workflow_id=wid,confirmation_payload={'confirm_nonce':body.confirm_nonce},client_request_id=body.request_id)
-        if result.get('error_code'): raise DomainError(result['error_code'],result['answer'])
+        if result.get('error_code'):
+            error=DomainError(result['error_code'],result['answer'])
+            error.trace_id,error.invocation_id=result['trace_id'],result['invocation_id']
+            error.workflow_result=result.get('refund_workflow_result')
+            raise error
         return envelope(result)
     @app.get('/api/v1/invocations/{ident}')
     def invocation(ident:str,a=Depends(actor)): return envelope(agent.harness.controller.read(a,ident))

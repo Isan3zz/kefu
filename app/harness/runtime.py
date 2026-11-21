@@ -20,6 +20,7 @@ class HarnessServices:
     tools:ToolExecutor
     telemetry:Telemetry
     budget:RunBudget
+    controller:RunController
     context:object=None
     image_ids:tuple[str, ...]=()
     allow_external_image_send:bool=False
@@ -52,8 +53,14 @@ class HarnessFacade:
         return await self._invoke(principal,conversation_id,'conv:'+conversation_id,body,client_request_id,None,mode,evaluation,legacy,lambda ctx,services:self.agent._chat(principal,conversation_id,message,mode,skill_mode,ctx,services))
     async def resume_workflow(self,*,principal,workflow_id,confirmation_payload,client_request_id=None,legacy=False):
         workflow=self.b.workflow(principal,workflow_id)
-        body={'kind':'confirm','workflow_id':workflow_id,'confirmation_hash':__import__('hashlib').sha256(confirmation_payload['confirm_nonce'].encode()).hexdigest()}
-        return await self._invoke(principal,workflow['conversation_id'],workflow['graph_thread_id'],body,client_request_id,workflow_id,'real',None,legacy,lambda ctx,services:self.agent._confirm_and_archive(principal,workflow_id,confirmation_payload['confirm_nonce'],ctx,services))
+        nonce=confirmation_payload['confirm_nonce']
+        body={'kind':'confirm','workflow_id':workflow_id,'confirmation_hash':__import__('hashlib').sha256(nonce.encode()).hexdigest()}
+        async def confirm(ctx,services):
+            result=await self.agent.refunds.confirm(principal,workflow,nonce,ctx,services)
+            return self.agent.refund_response(result,workflow,trace_id=ctx.trace_id)
+        return await self._invoke(principal,workflow['conversation_id'],workflow['graph_thread_id'],body,
+                                  client_request_id,workflow_id,'real',None,legacy,confirm,
+                                  workflow=workflow,confirmation_nonce=nonce)
     async def stream_chat(self,**kwargs):
         def event(kind,data): return 'event: '+kind+'\ndata: '+json.dumps(data,ensure_ascii=False)+'\n\n'
         yield event('status',{'status':'running'})
@@ -69,10 +76,19 @@ class HarnessFacade:
             yield event('done',result)
         except DomainError as error:
             yield event('error',{'code':error.code,'message':error.message,'invocation_id':getattr(error,'invocation_id',None),'trace_id':getattr(error,'trace_id',None)})
-    async def _invoke(self,principal,conv,thread,body,key,wid,mode,evaluation,legacy,operation):
+    async def _invoke(self,principal,conv,thread,body,key,wid,mode,evaluation,legacy,operation,*,workflow=None,confirmation_nonce=None):
         if not self.config.harness_enabled: raise HarnessFailure('CONFIG_ERROR','HARNESS_ENABLED=false 已暂停 Agent 执行；不会绕过运行时安全控制')
         ctx,replay=self.controller.begin(principal,conv,thread,body,key,wid,mode,evaluation or evaluation_context.get())
         if replay is not None:
+            cached_refund=replay.get('refund_workflow_result') or {}
+            if (workflow and not replay.get('processing') and cached_refund.get('reason')!='RECEIPT_MISMATCH'
+                    and replay.get('error_code') in (None,'UNKNOWN_OUTCOME','INTERNAL_ERROR')):
+                self.b.check_refund_nonce(principal,wid,confirmation_nonce)
+                result=await self.agent.refunds.reconcile(principal,workflow)
+                replay=self.agent.refund_response(result,workflow) | {
+                    'invocation_id':replay['invocation_id'],'trace_id':replay['trace_id'],
+                    'invocation_status':{'VERIFIED_SUCCESS':'SUCCEEDED','FAILED':'FAILED','UNKNOWN':'UNKNOWN_OUTCOME'}[result.status],
+                }
             if body.get('image_ids'):
                 await asyncio.to_thread(self.agent.images.bind, principal, conv, body['image_ids'])
             if 'cards' in replay:
@@ -86,7 +102,7 @@ class HarnessFacade:
                     self.config.vlm_model if body.get('allow_external_image_send') else self.config.llm_model)
         recorder=TraceRecorder(self.b,principal,conv,self.config,trace_id=ctx.trace_id,invocation_id=ctx.invocation_id,parent_invocation_id=ctx.parent_invocation_id,graph_thread_id=ctx.graph_thread_id,workflow_id=wid,model_id=model_id)
         # Injected services are explicit; audit ContextVar is not an authorization source.
-        services=HarnessServices(self.fake_model if mode=='deterministic' else self.model,self.tools,telemetry,budget)
+        services=HarnessServices(self.fake_model if mode=='deterministic' else self.model,self.tools,telemetry,budget,self.controller)
         from app.harness.context_manager import ContextManager
         services.context=ContextManager(self.b,self.config)
         services.image_ids=tuple(body.get('image_ids', ()))
@@ -111,6 +127,8 @@ class HarnessFacade:
                                 raise
                         result=await operation(ctx,services)
                 code=result.get('error_code')
+                if workflow and code:
+                    recorder.emit('error',status='error',error_code=code)
                 status='UNKNOWN_OUTCOME' if code=='UNKNOWN_OUTCOME' else 'TIMED_OUT' if code=='RUN_TIMEOUT' else 'FAILED' if code else 'SUCCEEDED'
                 pending=result.get('pending_confirmation')
                 if pending:
@@ -123,12 +141,16 @@ class HarnessFacade:
                 return result
             except BaseException as exc:
                 code=exc.code if isinstance(exc,DomainError) else 'RUN_TIMEOUT' if isinstance(exc,TimeoutError) else 'RUN_CANCELLED' if isinstance(exc,asyncio.CancelledError) else 'INTERNAL_ERROR'
+                if workflow and budget.write_started and isinstance(exc,(Exception,asyncio.CancelledError)):
+                    if code=='RUN_TIMEOUT':
+                        telemetry.emit('run.timeout',error_code=code,status='error')
+                    outcome=await self.agent.refunds.reconcile(principal,workflow,response_missing=True)
+                    code=outcome.error_code
+                    status={'VERIFIED_SUCCESS':'SUCCEEDED','FAILED':'FAILED','UNKNOWN':'UNKNOWN_OUTCOME'}[outcome.status]
+                    result=self.agent.refund_response(outcome,workflow)
+                    result.update(invocation_id=ctx.invocation_id,trace_id=ctx.trace_id,invocation_status=status)
+                    return result
                 if budget.write_started:
-                    actual=self.b.refund_outcome(principal,wid) if wid else None
-                    if actual:
-                        status='SUCCEEDED'; code=None
-                        result={**actual,'answer':'退款申请已受理，受理不代表已到账。','invocation_id':ctx.invocation_id,'trace_id':ctx.trace_id,'invocation_status':status}
-                        return result
                     status='UNKNOWN_OUTCOME'; code='UNKNOWN_OUTCOME'
                 else: status='UNKNOWN_OUTCOME' if code=='UNKNOWN_OUTCOME' else 'TIMED_OUT' if code=='RUN_TIMEOUT' else 'CANCELLED' if code=='RUN_CANCELLED' else 'FAILED'
                 public_code={'INTERNAL_ERROR':'SYSTEM_ERROR','RUN_TIMEOUT':'TIMEOUT','RUN_CANCELLED':'CANCELLED'}.get(code,code) if legacy else code
@@ -154,7 +176,11 @@ class HarnessFacade:
                 self.controller.update(ctx,status=status,error_code=code,finished_at=now(),response_message_id=(result or {}).get('message_id'),response_json=json.dumps(safe,ensure_ascii=False),model_calls=budget.model_calls,tool_calls=budget.tool_calls,prompt_tokens=budget.prompt_tokens if budget.provider_usage_complete else None,completion_tokens=budget.completion_tokens if budget.provider_usage_complete else None)
                 recorder.payload.update(model_attempts=budget.model_attempts,tool_calls=budget.tool_calls,tool_attempts=budget.tool_attempts,step_count=budget.steps,error_class=error_class(code) if code else None,unknown_outcome=status=='UNKNOWN_OUTCOME',invocation_status=status)
                 try:
-                    recorder.finish(business_outcome=self.b.workflow(principal,wid)['status'] if wid else (result or {}).get('pending_confirmation',{}).get('status','NONE') if (result or {}).get('pending_confirmation') else 'NONE')
+                    refund=(result or {}).get('refund_workflow_result') or {}
+                    business_outcome=refund.get('status','NONE')
+                    if refund.get('verified'):
+                        business_outcome='REQUEST_ACCEPTED'
+                    recorder.finish(business_outcome=business_outcome)
                 finally:
                     self.controller.active.discard(ctx.invocation_id)
                     active_trace.reset(marker)

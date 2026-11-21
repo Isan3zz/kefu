@@ -5,6 +5,7 @@ Read `DEVELOPMENT_SPEC.md` in full before making architectural decisions. It is 
 ## Non-negotiable technical choices
 
 - Python 3.11; FastAPI; LangGraph; FastMCP; Chroma; SQLite; Agent Skills; pytest.
+- Use MCP wrappers only for tools the main Agent can call. The main Agent starts refunds through `begin_refund_workflow`. The confirmed Refund Workflow calls Business directly for submission and verification.
 - Local **BAAI/bge-m3** embeddings and **BAAI/bge-reranker-v2-m3** reranker. Their weights are downloaded via a separate explicit command and loaded from local paths only.
 - Main LLM uses a configurable OpenAI-compatible API. Offline tests must run with fakes; do not disguise fake-model metrics as real-model results.
 - Business permissions, refund confirmation and idempotency are enforced by deterministic backend rules. Skills and LLM prompts do not authorize sensitive operations.

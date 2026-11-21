@@ -2,7 +2,6 @@ import asyncio,json,os,subprocess,sys
 from pathlib import Path
 from sqlalchemy import select,func
 import httpx,pytest
-from fastmcp import Client
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from app.db import agent_invocations,refund_requests,tickets,traces
 from app.business import DomainError
@@ -47,13 +46,13 @@ async def test_H07_step_limit_no_tools(env,monkeypatch):
     assert not any(e['type']=='tool.started' for e in records(env)[0]['events'])
 
 async def test_H13_timeout_after_refund_commit_reconciles_original_key(env,monkeypatch):
-    original=Client.call_tool; writes=0
-    async def lose(self,name,*args,**kwargs):
+    original=env['b'].submit; writes=0
+    def lose(actor,wid):
         nonlocal writes
-        result=await original(self,name,*args,**kwargs)
-        if name=='submit_refund_request': writes+=1; raise TimeoutError('lost response')
-        return result
-    monkeypatch.setattr(Client,'call_tool',lose)
+        original(actor,wid)
+        writes+=1
+        raise TimeoutError('lost Business result')
+    monkeypatch.setattr(env['b'],'submit',lose)
     preview=await env['agent'].chat(env['a'],env['conv'],'退订单 O1001','deterministic'); p=preview['pending_confirmation']
     confirmed=await env['agent'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
     replay=await env['agent'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
@@ -65,7 +64,7 @@ async def test_H14_H15_pending_checkpoint_survives_consultation_and_reentry(env)
     env['rag'].build('knowledge')
     agent=env['agent']; first=await agent.chat(env['a'],env['conv'],'退订单 O1001','deterministic'); p=first['pending_confirmation']
     async with AsyncSqliteSaver.from_conn_string(env['cfg'].checkpoint_db_path) as saver:
-        graph=agent.refund_graph(env['a'],saver); cfg={'configurable':{'thread_id':'wf:'+p['workflow_id']}}
+        graph=agent.refunds.graph(env['a'],saver); cfg={'configurable':{'thread_id':'wf:'+p['workflow_id']}}
         initial=await graph.aget_state(cfg)
         await agent.chat(env['a'],env['conv'],'耳机有哪些颜色','deterministic')
         after=await graph.aget_state(cfg)

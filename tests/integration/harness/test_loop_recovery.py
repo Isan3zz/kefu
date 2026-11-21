@@ -54,14 +54,14 @@ async def crash_chat(scenario, conversation_id, text):
 
     gateway._call = dispatch_then_crash
     if scenario == 'preview':
-        agent.start_workflow = crash_before_workflow
+        agent.refunds.start = crash_before_workflow
     if scenario == 'interrupt':
-        import app.agent as agent_module
+        import app.refund_workflow as workflow_module
 
         def crash_before_interrupt(*args):
             os._exit(27)
 
-        agent_module.interrupt = crash_before_interrupt
+        workflow_module.interrupt = crash_before_interrupt
     await agent.chat(Actor('user_a', 'a'), conversation_id, text, 'deterministic', request_id='crash-key')
 
 

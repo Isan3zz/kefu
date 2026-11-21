@@ -125,9 +125,13 @@ def assertions(case,trace,final):
     tools=[t['name'] for t in trace.get('tool_events',[])]
     unexpected=[e for e in trace.get('tool_events',[]) if e.get('status')=='error' and e.get('error_code') not in ('UNKNOWN_OUTCOME',expected.get('error_code'))]
     if unexpected: check('tool_execution',False,True,'TOOL_EXECUTION_ERROR')
+    submit_count=final.get('workflow_submission_count',tools.count('submit_refund_request'))
     for key in ('required_tools','forbidden_tools'):
         if key in expected:
-            ok=set(expected[key]).issubset(tools) if key=='required_tools' else not set(expected[key])&set(tools)
+            if key=='required_tools':
+                ok=set(expected[key]).issubset(tools)
+            else:
+                ok=not set(expected[key])&set(tools) and not ('submit_refund_request' in expected[key] and submit_count)
             check(key,ok,True,'TOOL_SELECTION_ERROR' if key=='required_tools' else 'WORKFLOW_VIOLATION')
     if 'tool_order' in expected:
         cursor=0; ordered=True
@@ -138,7 +142,7 @@ def assertions(case,trace,final):
     if 'tool_arguments' in expected:
         ok=all(any(e['name']==wanted['name'] and all(e.get('args',{}).get(k)==v for k,v in wanted['args'].items()) for e in trace.get('tool_events',[])) for wanted in expected['tool_arguments'])
         check('tool_arguments',ok,True,'TOOL_ARGUMENT_ERROR')
-    if 'submit_tool_count_max' in expected: check('submit_tool_count_max',tools.count('submit_refund_request')<=expected['submit_tool_count_max'],True,'IDEMPOTENCY_VIOLATION')
+    if 'submit_tool_count_max' in expected: check('submit_tool_count_max',submit_count<=expected['submit_tool_count_max'],True,'IDEMPOTENCY_VIOLATION')
     if 'terminal_reason' in expected: check('terminal_reason',final.get('terminal_reason'),expected['terminal_reason'],'LOOP_TERMINATION_ERROR')
     if 'max_iterations' in expected: check('max_iterations',final.get('iterations',0)<=expected['max_iterations'],True,'LOOP_BUDGET_ERROR')
     if 'activated_skills' in expected: check('activated_skills',sorted(final.get('activated_skills',[])),sorted(expected['activated_skills']),'SKILL_ACTIVATION_ERROR')
@@ -293,7 +297,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
                         if not pending: raise AssertionError('No pending confirmation')
                         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
                         async with AsyncSqliteSaver.from_conn_string(cfg.checkpoint_db_path) as saver:
-                            state=await agent.refund_graph(a,saver).aget_state({'configurable':{'thread_id':'wf:'+pending['workflow_id']}})
+                            state=await agent.refunds.graph(a,saver).aget_state({'configurable':{'thread_id':'wf:'+pending['workflow_id']}})
                             if not state.interrupts or state.interrupts[0].value['kind']!=step['kind']: raise AssertionError('Persisted graph is not interrupted')
                     elif typ=='cancel':
                         b.cancel(a,pending['workflow_id'])
@@ -353,6 +357,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
             # A normalized business call is counted once; transport attempts remain in Trace.
             normalized_operations={e.get('operation_id') for e in all_tools if e.get('layer')=='harness'}
             all_tools=[e for e in all_tools if e.get('layer')=='harness' or e.get('operation_id') not in normalized_operations]
+            final['workflow_submission_count']=sum(event['type']=='workflow.commit.started' for t in trace_payloads for event in t['events'])
             final['illegal_attempt']=any(e['name']=='submit_refund_request' and e.get('status')=='blocked' for e in all_tools) or any(e['type']=='policy.denied' for t in trace_payloads for e in t['events'])
             final['eligibility_reason']=next((e.get('result',{}).get('data',{}).get('reason_code') for e in reversed(all_tools) if e['name']=='check_refund_eligibility' and e.get('ok')),None)
             final['shipping_order_id']=next((e.get('args',{}).get('order_id') for e in reversed(all_tools) if e['name']=='track_shipment'),None)

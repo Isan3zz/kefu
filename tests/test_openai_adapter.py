@@ -240,6 +240,22 @@ async def test_agent_composes_refund_eligibility_with_each_verified_order(env,lo
     assert count(env,workflow_instances)==count(env,refund_requests)==0
 
 
+async def test_agent_cannot_turn_unknown_refund_into_success_while_answering_shipping(env,loop_chat):
+    p=env['b'].preview(env['a'],env['conv'],'O1001')
+    env['b'].confirm(env['a'],p['workflow_id'],p['confirm_nonce'])
+    assert env['b'].claim_refund_submission(env['a'],p['workflow_id'])
+    decisions=[
+        [call('begin_refund_workflow',{'order_id':'O1001'})],
+        [call('track_shipment',{'order_id':'O1002'})],
+        '退款已受理，申请编号 forged-id。物流已到。',
+    ]
+    result,_,_,_=await loop_chat('退款 O1001，另外查 O1002 的物流。',decisions)
+    assert result['refund_workflow_result']['status']=='UNKNOWN'
+    assert '暂未确认' in result['answer'] and '运输中' in result['answer']
+    assert '已受理' not in result['answer'] and 'forged-id' not in result['answer']
+    assert count(env,refund_requests)==0
+
+
 async def test_agent_product_tool_exposes_and_applies_generic_filters(env,loop_chat):
     from app.product_fixtures import import_product_fixtures
     import_product_fixtures(env['db'])

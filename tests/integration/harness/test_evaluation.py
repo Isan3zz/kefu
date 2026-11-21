@@ -25,18 +25,17 @@ async def test_H24_evaluation_works_with_no_optional_telemetry_service(env,monke
         event['type']=='invocation.started' and event.get('operation')=='confirm'
         for event in trace['events']
     )]
-    assert sorted(trace['tool_calls'] for trace in confirm_traces)==[0,1]
+    assert [trace['tool_calls'] for trace in confirm_traces]==[0,0]
+    assert repeat['final_state']['workflow_submission_count']==1
     assert repeat['tool_call_count']==sum(trace['tool_calls'] for trace in repeat['traces'])
 
 async def test_H25_unknown_write_is_unresolved_not_a_failed_refund_verdict(env,tmp_path,monkeypatch):
     import json
-    from app.mcp import Gateway
+    from app.business import Business
     from app.evaluation import review
-    original=Gateway._call
-    async def unknown(self,actor,name,args,*pos,**kwargs):
-        if name=='submit_refund_request': raise TimeoutError('cannot establish remote outcome')
-        return await original(self,actor,name,args,*pos,**kwargs)
-    monkeypatch.setattr(Gateway,'_call',unknown)
+    def unknown(self,actor,wid):
+        raise TimeoutError('cannot establish submission outcome')
+    monkeypatch.setattr(Business,'submit',unknown)
     case={'schema_version':'1.0','case_id':'unknown-refund','category':'workflow','steps':[{'type':'chat','content':'退订单 O1001'},{'type':'confirm'}],'expected':{'workflow_status':'REQUEST_ACCEPTED','refund_request_count_delta':1,'final_business_status':'ACCEPTED'},'tags':['mandatory']}
     dataset=tmp_path/'unknown.jsonl'; dataset.write_text(json.dumps(case,ensure_ascii=False)+'\n',encoding='utf-8')
     report=await run(dataset,config=env['cfg'])

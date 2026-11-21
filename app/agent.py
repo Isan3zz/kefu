@@ -1,11 +1,9 @@
 import asyncio
 import json
 import re
-import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import TypedDict
-from langgraph.graph import StateGraph,START,END
-from langgraph.types import interrupt,Command
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from sqlalchemy import select
 from app.config import settings
@@ -14,6 +12,7 @@ from app.db import *
 from app.skills import SkillManager
 from app.rag import RAG
 from app.observability import active_trace
+from app.refund_workflow import RefundWorkflow
 from app.memory.service import MemoryService
 from app.memory.trigger import management_request, recommendation_request, save_request_only
 
@@ -37,8 +36,6 @@ class State(TypedDict,total=False):
     pending_confirmation:dict|None
     tool_events:list[dict]
     retrieved_chunks:list[dict]
-    workflow_id:str
-    result:dict
     trace_id:str
 
 def fake_next_action(text):
@@ -83,6 +80,7 @@ class Agent:
         self.multimodal_index = MultimodalIndex(self.images, self.rag.client)
         from app.multimodal.retrieval import MultimodalRetrievalService
         self.multimodal = MultimodalRetrievalService(self.multimodal_index)
+        self.refunds = RefundWorkflow(business, config.checkpoint_db_path)
         self._llm_client=None
         from app.harness.runtime import HarnessFacade
         self.harness=HarnessFacade(self)
@@ -158,72 +156,42 @@ class Agent:
         pending = result.get('pending_confirmation')
         if pending and loop.confirmation_nonce:
             pending = {**pending, 'confirm_nonce':loop.confirmation_nonce}
-        return dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None), **({'cards':result['cards']} if result.get('cards') is not None else {}))
-    async def commit_refund(self,a,wid,ctx=None,services=None):
-        if ctx is None or services is None: raise DomainError('FORBIDDEN','退款提交必须经过 Harness workflow 能力入口')
-        previous=self.b.workflow(a,wid)['status']
-        services.telemetry.emit('workflow.transition',workflow_id=wid,previous=previous,next='SUBMITTING')
-        normalized=await services.tools.execute_refund_from_workflow(ctx=ctx,workflow_id=wid,budget=services.budget,telemetry=services.telemetry)
-        if not normalized.ok: raise DomainError(normalized.error['code'],normalized.error['message'])
-        actual=self.b.refund_outcome(a,wid)
-        if actual is None: raise DomainError('UNKNOWN_OUTCOME','没有可核对的退款受理记录，请查询原操作状态')
-        services.telemetry.emit('workflow.transition',workflow_id=wid,previous='SUBMITTING',next=self.b.workflow(a,wid)['status'])
-        return normalized.data
-    def refund_graph(self,a,saver,ctx=None,services=None):
-        async def wait(s):
-            interrupt({'kind':'refund_confirmation','workflow_id':s['workflow_id']})
-            w=self.b.workflow(a,s['workflow_id'])
-            if w['status'] not in ('CONFIRMED','REQUEST_ACCEPTED'): raise DomainError('FORBIDDEN')
-            return {}
-        async def commit(s):
-            return {'result':await self.commit_refund(a,s['workflow_id'],ctx,services)}
-        g=StateGraph(State); g.add_node('confirmation',wait); g.add_node('commit',commit); g.add_edge(START,'confirmation'); g.add_edge('confirmation','commit'); g.add_edge('commit',END)
-        return g.compile(checkpointer=saver)
-    async def start_workflow(self,a,wid,ctx=None,services=None):
-        async def start():
-            async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
-                graph=self.refund_graph(a,saver,ctx,services); config={'configurable':{'thread_id':'wf:'+wid}}
-                state=await graph.aget_state(config)
-                if not state.values or ('confirmation' in state.next and not state.interrupts):
-                    await graph.ainvoke(None if state.values else {'workflow_id':wid},config,durability='sync')
-                    state=await graph.aget_state(config)
-                if not state.interrupts or state.interrupts[0].value['kind']!='refund_confirmation': raise DomainError('SYSTEM_ERROR','工作流未持久化确认中断')
-                if services: services.telemetry.emit('workflow.interrupted',workflow_id=wid,graph_thread_id='wf:'+wid,interrupt_kind='refund_confirmation')
-        if services:
-            async with self.harness.controller.locks.acquire('wf:'+wid): await start()
-        else: await start()
+        response = dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None), **({'cards':result['cards']} if result.get('cards') is not None else {}))
+        if loop.refund_result:
+            response['refund_workflow_result'] = asdict(loop.refund_result)
+        return response
     async def confirm(self,a,wid,nonce,request_id=None):
-        return await self.harness.resume_workflow(principal=a,workflow_id=wid,confirmation_payload={'confirm_nonce':nonce},client_request_id=request_id,legacy=True)
-    async def _confirm_and_archive(self,a,wid,nonce,ctx,services):
-        workflow=self.b.workflow(a,wid)
-        result=await self._confirm(a,wid,nonce,ctx,services)
-        result={**result,'answer':'退款申请已受理，申请编号：'+result['refund_request_id']+'。受理不代表退款已到账。'}
-        with self.b.db.tx() as connection:
-            exists=connection.execute(select(messages.c.id).where(messages.c.conversation_id==workflow['conversation_id'],messages.c.role=='assistant',messages.c.content==result['answer'])).first()
-            if not exists:
-                connection.execute(messages.insert().values(id=uid('msg-'),conversation_id=workflow['conversation_id'],role='assistant',content=result['answer'],created_at=now(),trace_id=ctx.trace_id))
-                connection.execute(conversations.update().where(conversations.c.id==workflow['conversation_id']).values(updated_at=now()))
-        active_trace.get().emit('workflow',to=self.b.workflow(a,wid)['status'],result=result)
+        result = await self.harness.resume_workflow(
+            principal=a, workflow_id=wid, confirmation_payload={'confirm_nonce':nonce},
+            client_request_id=request_id, legacy=True,
+        )
+        if result.get('error_code'):
+            error = DomainError(result['error_code'], result['answer'])
+            error.invocation_id, error.trace_id = result['invocation_id'], result['trace_id']
+            error.workflow_result = result.get('refund_workflow_result')
+            raise error
         return result
-    async def _confirm(self,a,wid,nonce,ctx,services):
-        previous=self.b.workflow(a,wid)['status']
-        w=self.b.confirm(a,wid,nonce)
-        services.telemetry.emit('workflow.transition',workflow_id=wid,previous=previous,next=w['status'],version=w['version'])
-        if w['status']=='REQUEST_ACCEPTED':
-            result=self.b.refund_outcome(a,wid)
-            if result is None: raise DomainError('UNKNOWN_OUTCOME')
-            return result
-        async with AsyncSqliteSaver.from_conn_string(self.config.checkpoint_db_path) as saver:
-            graph=self.refund_graph(a,saver,ctx,services); config={'configurable':{'thread_id':w['graph_thread_id']}}
-            state=await graph.aget_state(config)
-            if not state.values or ('confirmation' in state.next and not state.interrupts):
-                await graph.ainvoke(None if state.values else {'workflow_id':wid},config,durability='sync')
-                state=await graph.aget_state(config)
-            services.telemetry.emit('workflow.resumed',workflow_id=wid,graph_thread_id=w['graph_thread_id'],new_invocation_id=ctx.invocation_id)
-            if state.next:
-                result=await graph.ainvoke(Command(resume=True) if state.interrupts else None,config)
-                return result['result']
-            return await self.commit_refund(a,wid,ctx,services)
+
+    def refund_response(self, result, workflow, *, trace_id=None):
+        reply = {'refund_workflow_result':asdict(result), 'answer':result.reply(),
+                 'error_code':result.error_code}
+        if result.status == 'VERIFIED_SUCCESS':
+            reply.update(refund_request_id=result.refund_request_id, status=result.business_status,
+                         idempotent_replay=result.idempotent_replay)
+        if trace_id and result.status == 'VERIFIED_SUCCESS':
+            with self.b.db.tx() as connection:
+                conv = workflow['conversation_id']
+                exists = connection.execute(select(messages.c.id).where(
+                    messages.c.conversation_id==conv, messages.c.role=='assistant',
+                    messages.c.content==reply['answer'],
+                )).first()
+                if not exists:
+                    connection.execute(messages.insert().values(
+                        id=uid('msg-'), conversation_id=conv, role='assistant', content=reply['answer'],
+                        created_at=now(), trace_id=trace_id,
+                    ))
+                    connection.execute(conversations.update().where(conversations.c.id==conv).values(updated_at=now()))
+        return reply
 
 def pending_status(result):
     return result['pending_confirmation']['status'] if result.get('pending_confirmation') else 'NONE'
