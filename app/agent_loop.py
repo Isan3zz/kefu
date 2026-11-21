@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Annotated
 
@@ -22,6 +23,7 @@ from app.memory.trigger import CHANGE, STABLE, recommendation_request
 from app.multimodal.retrieval import TOOL_ARGS
 from app.multimodal.tool_adapter import tool_schemas
 from app.observability import active_trace, clean
+from app.refund_workflow import RefundWorkflowResult
 from app.reply_composer import FACT_MARKER, REPLY_INSTRUCTION, ReplyFact, render_checked
 
 PROMPT_VERSION = 'agent-loop-v6'
@@ -85,6 +87,7 @@ class AgentLoop:
         self.catalog = tool_catalog(skill_mode)
         self.visual_tools = set()
         self.confirmation_nonce, self.memories = None, []
+        self.refund_result: RefundWorkflowResult | None = None
         self.recommendation = recommendation_request(text)
         self.ceiling = budget_for(text, ()) if self.recommendation else None
         self.visual_ceiling = explicit_price_ceiling(text)
@@ -309,33 +312,14 @@ class AgentLoop:
                                     snapshot=chunks[0]['snapshot'] if chunks else None)
             return [{key:chunk[key] for key in ('chunk_id','doc_id','document_title','version') if key in chunk}
                     | {'snippet':chunk['content'][:400]} for chunk in chunks]
-        principal = self.ctx.principal
-        current = next((tool for tool in reversed(progress['loop_observations']) if tool['name']=='check_refund_eligibility' and
-                        tool['args'].get('order_id')==args['order_id'] and tool['result']['ok']), None)
-        if current is None:
-            check = await self.services.tools.invoke(ctx=self.ctx, skill_name='refund-processing',tool_name='check_refund_eligibility',
-                                                      arguments=args,budget=self.budget,telemetry=self.telemetry)
-            current = dict(name='check_refund_eligibility',args=args,result=check.envelope(),duration_ms=check.latency_ms)
-            progress['loop_observations'].append(clean(current))
-        eligibility = current['result']
-        if not eligibility['ok']:
-            raise DomainError(eligibility['error']['code'],eligibility['error']['message'])
-        if not eligibility['data']['eligible']:
-            return eligibility['data']
-        try:
-            preview = self.agent.b.preview(principal,self.ctx.conversation_id,args['order_id'],
-                                           reuse_pending=True, invocation_id=self.ctx.invocation_id)
-        except DomainError as error:
-            if error.code != 'BUSINESS_RULE_FAILED':
-                raise
-            return {'eligible':False,'reason_code':error.message}
-        self.budget.write_started = True
-        await self.agent.start_workflow(principal,preview['workflow_id'],self.ctx,self.services)
-        self.confirmation_nonce = preview.get('confirm_nonce')
-        progress['pending_confirmation'] = clean(preview)
-        active_trace.get().emit('workflow', to='WAITING_CONFIRMATION',workflow_id=preview['workflow_id'])
-        self.emit('workflow_pending', workflow_id=preview['workflow_id'],graph_thread_id='wf:'+preview['workflow_id'])
-        return clean(preview)
+    async def begin_refund(self, args, progress, preview):
+        result, preview = await self.agent.refunds.prepare(self.ctx, self.services, args['order_id'], preview)
+        self.refund_result = result
+        if preview:
+            self.confirmation_nonce = preview.get('confirm_nonce')
+            progress['pending_confirmation'] = clean(preview)
+            self.emit('workflow_pending', workflow_id=result.workflow_id, graph_thread_id='wf:'+result.workflow_id)
+        return asdict(result)
 
     async def execute(self, state):
         proposal = next(message for message in reversed(state['loop_messages']) if isinstance(message, AIMessage))
@@ -368,6 +352,15 @@ class AgentLoop:
             else:
                 result = await self.services.tools.invoke(**execution,skill_name=skill)
             envelope = result.envelope()
+            data = result.data
+            if name == 'begin_refund_workflow' and result.ok:
+                data = envelope['data'] = await self.begin_refund(args,progress,result.data)
+            elif name == 'get_order' and result.ok and '退款' in self.text:
+                order = dict(result.data)
+                order['refund_status_reply'], order['refund_request'] = self.agent.refunds.status_for_order(
+                    self.ctx.principal, args['order_id'],
+                )
+                data = envelope['data'] = order
             if name == 'load_skill' and result.ok:
                 envelope['data'].pop('guidance', None)
             progress['loop_observations'].append(clean(dict(name=name,args=args,result=envelope,duration_ms=result.latency_ms)))
@@ -378,7 +371,6 @@ class AgentLoop:
                 progress['intent'] = 'product_consultation'
             if not result.ok:
                 raise DomainError(result.error['code'],result.error['message'])
-            data = result.data
             if name == 'get_orders':
                 order_ids = [row['id'] for row in data]
                 progress.update(order_ids=order_ids, active_order_id=order_ids[0] if len(order_ids)==1 else None)
@@ -586,7 +578,7 @@ class AgentLoop:
         product_rows = []
         product_searched = False
         labels = {'get_orders':'本人订单列表','get_order':'订单详情','track_shipment':'物流',
-                  'search_products':'实时商品','create_ticket':'人工工单','begin_refund_workflow':'退款资格',
+                  'search_products':'实时商品','create_ticket':'人工工单',
                   'check_refund_eligibility':'退款资格'}
         for tool in tools:
             name, result = tool['name'], tool['result']
@@ -594,10 +586,10 @@ class AgentLoop:
                 product_searched = True
                 product_rows.extend(result['data'])
                 continue
-            if name not in labels or not result['ok'] or (name=='begin_refund_workflow' and state['pending_confirmation']):
+            if name not in labels or not result['ok']:
                 continue
-            if name=='begin_refund_workflow' and any(prior['name']=='check_refund_eligibility' and prior['result']['ok']
-                    and prior['args']==tool['args'] and prior['result']['data']==result['data'] for prior in tools):
+            if (self.refund_result and name in ('check_refund_eligibility', 'get_order')
+                    and tool['args'].get('order_id') == self.refund_result.order_id):
                 continue
             facts[f'B{len(facts)+1}'] = ReplyFact(labels[name], self.display_business(name,result['data'],tool['args'],state['loop_memory_ids']))
         if product_searched:
@@ -636,13 +628,8 @@ class AgentLoop:
                 return '未查询到您的订单'
             orders = '、'.join(f"{order['id']}（{statuses.get(order['status'],order['status'])}）" for order in data)
             return f'本次查到 {len(data)} 笔订单：{orders}'
-        if name=='get_order' and '退款' in self.text:
-            refund=data.get('refund_request')
-            if not refund:
-                return '该订单目前没有已受理的退款申请；预览待确认不等于提交成功。'
-            if refund['status']=='ACCEPTED':
-                return '退款申请已受理，申请编号：'+refund['refund_request_id']+'。受理不代表退款已到账。'
-            return '退款申请状态：'+refund['status']
+        if name=='get_order' and 'refund_status_reply' in data:
+            return data['refund_status_reply']
         if name=='get_order':
             cents = data['paid_amount_cents']
             return f"订单 {data['id']} {statuses.get(data['status'],data['status'])}，实付 {cents//100}.{cents%100:02d} 元"
@@ -655,7 +642,7 @@ class AgentLoop:
             return f'订单 {order_id} 的物流状态：{entries}'
         if name=='create_ticket':
             return '已创建人工工单：'+data['ticket_id']
-        if name in ('begin_refund_workflow','check_refund_eligibility'):
+        if name == 'check_refund_eligibility':
             order_id = arguments['order_id']
             if data.get('eligible'):
                 return f'订单 {order_id} 可申请退款。本次仅查询资格，未提交。'
@@ -772,11 +759,11 @@ class AgentLoop:
             if citations and not facts:
                 versions_ok=all(ident in citations and str(citations[ident]['version'])==version.rstrip('.')
                                 for ident,version in VERSIONED_CITATION.findall(draft))
-                parts.insert(0,draft if ids and ids<=citations.keys() and versions_ok and not CLAIM.search(draft)
+                parts.insert(0,draft if not self.refund_result and ids and ids<=citations.keys() and versions_ok and not CLAIM.search(draft)
                              and not FACT_MARKER.search(draft) else self.display_knowledge(citations.values()))
             if reason=='LIMIT':
                 parts.append('已停止重复或超限的查询；如需继续，请缩小问题范围。')
-            if not parts:
+            if not parts and not self.refund_result:
                 if error:
                     parts.append('查询结果未能确认，请核对信息后重试。')
                     if reason=='COMPLETED': reason='NEEDS_INPUT' if error=='INVALID_ARGUMENT' else 'ERROR'
@@ -815,6 +802,8 @@ class AgentLoop:
             answer = '这次仅能使用本地图片检索，尚未取得可用候选。请补充图片中的商品、型号或订单号。'
             if reason == 'COMPLETED':
                 reason = 'NEEDS_INPUT'
+        if self.refund_result and not pending:
+            answer = '\n'.join(filter(None, (self.refund_result.reply(), answer)))
         visual_errors = {
             'MULTIMODAL_MODEL_NOT_READY': '缺少可用的本地 Chinese-CLIP，请运行 python scripts/download_chinese_clip.py。',
             'MULTIMODAL_ENCODER_ERROR': '图片或文本编码失败，请检查模型和设备配置。',

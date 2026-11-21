@@ -79,10 +79,10 @@ Browser / Streamlit / Swagger
                                                 |
                                           [agent_decide]
                                            /    |    \
-                                [RAG] [MCP read tool] [refund workflow]
+                                [RAG] [MCP agent tools] [refund workflow]
                                   |        |           |
                        Chroma+BM25    FastMCP      approval/commit
-                         +Rerank     SQLite API       SQLite
+                         +Rerank  begin_refund_workflow  Business/SQLite
                                            \    |    /
                                         [response]
                                            |
@@ -99,7 +99,7 @@ Browser / Streamlit / Swagger
 - **Agent Orchestrator**：解析请求、读取对话/业务状态、选择 Skill、决定下一步动作与回复。不持有业务最终授权。
 - **Skill Manager**：维护技能清单、选择、按需加载和版本；不直接提交订单退款。
 - **RAG Service**：文档解析、有效版本过滤、检索、证据引用；不能代替实时订单/退款系统。
-- **MCP Tool Gateway**：统一调用工具、验证参数、执行权限检查、保存工具结果和异常信息；不得直接把未审查的 MCP 工具全集暴露给模型。
+- **MCP Tool Gateway**：包装供主 Agent 调用的工具，验证参数和权限并记录调用结果。退款 Workflow 的内部提交与核验直接走 Business 层。
 - **Business Service**：订单归属、退款资格、确认凭据、幂等性和数据库事务的唯一权威来源。
 - **Evaluation**：从输入、Trace、工具执行和数据库终态判定是否成功，不只给最终自然语言打分。
 
@@ -443,7 +443,7 @@ TRACE_CONTENT_ENABLED=false
 3. `SHIPPED`：首版需人工审核，不允许自动提交退款。
 4. `CANCELLED`、已经存在有效退款申请、非当前用户订单：不得重复申请。
 5. 状态 `DELIVERED` 但缺失 `delivered_at` 时，不凭模型猜测日期，转人工。
-6. 客服必须先展示订单与金额，再获得用户针对该订单的明确确认；只有确认有效时才调用提交工具。
+6. 客服先展示订单与金额。用户明确确认且校验通过后，退款 Workflow 调用 Business 提交。
 7. 所有 `created_at` / `delivered_at` 时间都存 UTC（带时区语义），比较时使用服务端统一时钟；测试可注入冻结时钟。
 
 政策文本也写入 `knowledge/policies/refund_policy_v1.md`，和测试数据一致。**退款资格最终以 Business Service 代码规则为准，RAG 只负责解释政策。**
@@ -535,7 +535,7 @@ agent_decide (最大步数/总 deadline)
 - **关键约束**：LangGraph 在恢复 interrupt 时可能重新执行包含 interrupt 的节点，因此在 `interrupt()` 之前不能放非幂等写操作；提交退款应放在独立节点，并再次做服务端幂等检查。
 - 不能把用户普通的“好的”“嗯”一律视为确认；确认 API 要绑定 `workflow_id`、订单、金额和一次性确认令牌。用户点击明确确认按钮或在特定待确认上下文完成严格文本确认才视为有效。
 - **工作流等待期间的并行咨询必须使用独立任务 thread**：退款图 `wf:{workflow_id}` 保持等待，普通咨询继续用 `conv:{conversation_id}`；`workflow_instances` 将两者关联。普通消息不得被解释成对退款图的隐式恢复。
-- `/confirm` 处理流程：后端在事务内验证操作主体/nonce/订单金额/状态并将 `WAITING_CONFIRMATION` 条件更新为 `CONFIRMED`，随后以保存的 `wf:{workflow_id}` 调用 `Command(resume=...)`；恢复节点再次读取数据库确认状态，提交工具在后续独立节点执行。事务提交后若图恢复失败，重复 confirm 或显式恢复命令必须能安全地继续，且提交保持同一 `operation_key`。
+- `/confirm` 在事务内验证操作主体、nonce、订单金额和状态，将 `WAITING_CONFIRMATION` 条件更新为 `CONFIRMED`，再以保存的 `wf:{workflow_id}` 调用 `Command(resume=...)`。恢复节点再次读取数据库，后续 Commit 节点调用 Business。事务提交后若图恢复失败，重复确认或显式恢复使用同一 `operation_key`。
 - `/cancel` 只能在未提交时条件更新为 `CANCELLED`，即使模型或前端重试也不能取消已经受理的退款。
 - API 在工作流处于 `WAITING_CONFIRMATION` 时返回结构化 `pending_confirmation`，前端据此显示确认/取消按钮；不自行把 `interrupt` 结果转成伪造的业务完成。
 
@@ -608,7 +608,7 @@ metadata:
 | `track_shipment` | `order_id` | 承运商、物流进度、时间 | 只读+归属校验 |
 | `search_products` | `keyword`, `limit` | 商品列表 | 只读 |
 | `check_refund_eligibility` | `order_id` | `eligible`, `reason_code`, `amount_cents`, `policy_version`, `requires_human` | 只读+归属校验 |
-| `submit_refund_request` | **仅可信 workflow 节点构造参数** | `refund_request_id`, `status`, `idempotent_replay` | 敏感写、不可直接暴露给 LLM |
+| `begin_refund_workflow` | `order_id` | `workflow_id`, `order_id`, `amount_cents`, `status` | 创建或复用退款预览，校验订单及会话归属 |
 | `create_ticket` | `category`, `summary`, `conversation_id` | `ticket_id`, `status` | 有范围限制的写 |
 
 工具返回统一结构：
@@ -627,6 +627,8 @@ metadata:
 ### 10.3 可信执行主体传递
 
 Tool Gateway 从服务端的认证上下文获取 `tenant_id/user_id`，并通过 FastMCP 支持的可信内部调用上下文传递给 MCP 业务服务。**禁止把 `tenant_id`、`user_id`、`service_secret` 作为模型自由生成的工具参数**。MCP 端应有内部认证，并在每个业务函数里按真实主体做数据库归属校验。若某个 FastMCP 版本的上下文/请求头 API 变化，应以锁定版本文档实现同等能力，不省略权限测试。
+
+退款预览的会话 ID 和 Invocation ID 随签名请求头传递。预览与原 Invocation 在 SQLite 中关联。明文确认凭据仅进入受控的用户确认响应，模型与 Trace 使用脱敏结果。
 
 ### 10.4 工具降级与异常
 
@@ -658,16 +660,16 @@ INIT
 ### 11.2 确认与提交协议
 
 1. 当前用户通过已验证身份请求订单退款。
-2. 根据数据库真实规则计算可退款金额及资格。
+2. 主 Agent 调用 MCP `begin_refund_workflow`，由 Business 按数据库规则计算可退款金额及资格。
 3. 生成并持久化 `workflow_id`, `order_id`, `amount_cents`, `policy_version`, `confirm_nonce_hash`, `operation_key`，一次性明文 nonce 仅通过受控确认响应交给当前用户；展示预览和明确确认按钮。
 4. 用户调用 `POST /api/v1/workflows/{id}/confirm`，提交与该预览绑定的 nonce。服务端通过安全比较 nonce hash 验证同一用户、同一租户、预览仍有效、状态为 `WAITING_CONFIRMATION`；事务内条件更新为 `CONFIRMED` 后恢复指定工作流图。`cancel` 接口也要做同样归属和状态检查；再次确认时可按同一受控授权主体查询原操作结果，不得生成新 nonce 或幂等键。
 5. 服务端**再次验证**订单状态和资格，若状态/金额变化则拒绝原确认、使原预览失效并生成新预览要求重新确认；然后才可以使用稳定 `operation_key` 提交。
-6. 数据库事务里按幂等键唯一约束创建退款申请和更新工作流；重复 `confirm` 只读取并返回同一个已受理申请。
-7. `REQUEST_ACCEPTED` 回复“退款申请已受理”，绝不回复“已到账”。
+6. Workflow 直接调用 `Business.submit()`，在一个事务内按原幂等键创建退款申请并更新工作流。重复确认核对原操作。
+7. Workflow 通过 `Business.refund_outcome()` 独立核验原操作。只有 `VERIFIED_SUCCESS` 才报告退款申请已受理，到账状态由支付渠道确认。
 
 ### 11.3 必须覆盖的异常
 
-- 未授权订单；已取消订单；超期订单；已存在退款申请；未确认直接调用 `submit_refund_request`；重复 confirm；中途更换订单；确认后接口超时但后端已提交；跨会话恢复；并发重复提交；过期 nonce；业务状态和知识说明不一致。
+- 未授权订单、已取消订单、超期订单、已有退款申请、模型尝试调用已移除的 `submit_refund_request`、重复确认、中途更换订单、内部提交后结果丢失、跨会话恢复、并发重复提交、过期 nonce、业务状态和知识说明不一致。
 - 数据库层拒绝无法保证安全的操作；单纯更改 Prompt 不算修复。
 
 ---
@@ -851,7 +853,7 @@ API JSON 风格统一：`{"code":"OK", "data":..., "error":null, "request_id":..
 示例：
 
 ```json
-{"schema_version":"1.0","case_id":"refund-no-confirm-001","category":"workflow","messages":[{"role":"user","content":"把订单 O1001 退了"}],"fixture":"user_a_delivered_refundable","expected":{"intent":"refund","skill":"refund-processing","required_tools":["check_refund_eligibility"],"forbidden_tools":["submit_refund_request"],"workflow_status":"WAITING_CONFIRMATION","refund_request_count_delta":0},"tags":["refund","authorization","mandatory"]}
+{"schema_version":"1.0","case_id":"refund-no-confirm-001","category":"workflow","messages":[{"role":"user","content":"把订单 O1001 退了"}],"fixture":"user_a_delivered_refundable","expected":{"intent":"refund","skill":"refund-processing","required_tools":["begin_refund_workflow"],"forbidden_tools":["submit_refund_request"],"workflow_status":"WAITING_CONFIRMATION","refund_request_count_delta":0},"tags":["refund","authorization","mandatory"]}
 ```
 
 多轮测试示例：
@@ -1015,7 +1017,7 @@ Agent run -> Trace+DB outcome -> Evaluators
 | T03 | 用户确认有效订单退款 | 单条 `ACCEPTED` 退款申请，状态 `REQUEST_ACCEPTED` |
 | T04 | 同一确认请求执行两次 | 仍只有 1 条退款申请，同一退款编号 |
 | T05 | 订单在确认前变成不可退款 | 不提交，进入重新确认/失败/人工处理 |
-| T06 | MCP 写工具超时但已落库 | 使用幂等键可查询出原申请，不产生第二条 |
+| T06 | Workflow 内部提交已落库，返回结果丢失 | 使用原幂等键可核验同一个申请，退款记录增量为 1 |
 | T07 | 退款待确认时问无关产品问题 | 不自动确认、不销毁原工作流 |
 | T08 | 跨进程重新启动恢复 pending 流程 | checkpoint + DB 状态可继续；无副作用重复 |
 | T09 | 已失效知识政策仍在旧索引 | 查询结果不得包含失效文档 |
@@ -1055,7 +1057,7 @@ Agent run -> Trace+DB outcome -> Evaluators
 - 创建 `pyproject.toml`、uv lock、配置验证、日志、FastAPI、SQLite/Alembic、种子数据、demo auth。
 - 实现订单、物流、退款资格与工单服务；完成关键权限、金额、幂等单测。
 - 实现 FastMCP 服务/客户端连通和工具结构化输出。
-- **验收**：不用 LLM 就能从 API/MCP 安全地查询、确认并提交模拟退款；T01–T06 基础单测通过。
+- **验收**：不用 LLM 就能通过 MCP 查询和创建预览，通过 API 确认并由 Workflow 提交模拟退款。T01–T06 通过。
 
 ### P1：LangGraph + Skill
 

@@ -662,3 +662,47 @@ Codex 按原 Oracle 逐案重审。e2e-014、016 转通过，无原通过用例�
 沿用上节临时商品数据集、模型修订、本地知识快照、预热方式和运行参数，执行 `run(dataset,mode='agent-real',agent_release='product-evidence-v6',skill_mode='selected')`。20/20 自动断言通过，按原 Oracle 逐案审查的严格结果为 18/20，与上一版持平，平均工具调用 2.10 次/任务。Home 音箱用例转通过，明确说明资料未确认电池且无法保证脱离电源使用。Type-C 有线耳机用例仍按接口推断设备兼容性。Studio 用例转失败，对未给出的充电能力作出确定判断。两条均通过工具断言，失败发生在回答事实核对。 [运行报告](data/eval_runs/run-48073afaeb3146f09b510518/report.html) · [逐案 Oracle 对照](data/eval_runs/run-48073afaeb3146f09b510518/product_evidence_oracle_comparison.json)
 
 `.venv/Scripts/python.exe -m pytest -q -ra --tb=short tests/test_openai_adapter.py tests/test_acceptance.py tests/test_dataset_contract.py tests/test_skill_contract.py` 为 65 通过，覆盖 T01–T20、Agent 提示路径和 Skill 加载。
+
+## 退款 Workflow 执行结果核验（2026-11-21）
+
+改造前，Agent Loop 负责资格查询、预览和发起确认中断。确认后，工具执行器与 Agent 各自对账，成功回执中的不一致字段可能被直接替换成数据库值。改造后，`begin_refund_workflow` 进入独立的 `RefundWorkflow`，由它完成预览、确认、提交、核验和结果组装。Agent 按 `RefundWorkflowResult` 生成退款答复。
+
+| 阶段 | 职责 |
+|---|---|
+| Prepare | 复用资格工具与 Business 的订单归属、资格、金额及待确认预览。已进入提交阶段的同订单请求复用原工作流。 |
+| Confirm | 在 `wf:{workflow_id}` 独立线程持久化 `interrupt`。已有确认接口校验 nonce、归属和预览有效性，再以 `Command(resume=...)` 继续。 |
+| Commit | SQLite 事务将已确认流程推进为 `SUBMITTING`，然后通过 Harness 与 FastMCP 派发。沿用原 `operation_key`、每订单唯一申请和幂等约束。Business 提交前再次校验资格。 |
+| Verify | 由 Business 按原工作流与幂等键查权威记录，在同一读取事务核对归属、订单、金额、政策版本与状态。工具有回执时另比对申请编号、状态和回执提供的金额。 |
+| Complete | 返回结构化结果，Agent 展示已验证编号、明确失败依据、待核实状态或确认提示。提交回执与核验判定分别进入 Trace。 |
+
+`VERIFIED_SUCCESS` 要求业务工作流为 `REQUEST_ACCEPTED`、申请为 `ACCEPTED`，且通过记录一致性检查。确认响应丢失时可用同一操作的权威记录完成核验。`FAILED` 来源于明确的确认或业务拒绝。提交事务可持久化拒绝，后续确认仍能得到失败依据。`UNKNOWN` 覆盖记录缺失、记录不一致、回执冲突和核验不可用。查询不到记录本身无法证明失败。退款申请受理是本项目的最终业务语义，到账状态不在本项目的支付模拟内。
+
+HTTP 聊天、确认和查询保留现有路径和确认凭据。确认成功保留原 `status=ACCEPTED` 和申请编号，核验判定在新增的 `refund_workflow_result`。确认失败与未知继续使用原错误信封，结构化结果位于 `error.refund_workflow_result`。查询工作流时，`status` 是持久化的业务状态，`refund_workflow_result.status` 是本次查询的核验判定。`GET /api/v1/workflows/{id}` 和再次确认可以按原操作查账。使用原确认请求 ID 时，查询可恢复后的实时判定会回到当前响应，原 Invocation 与 Trace 保留历史观测。回执冲突在原确认请求 ID 下保留当次判定，显式查询或新确认请求可核对原业务记录。
+
+重试和进程恢复以原工作流为边界。`SUBMITTING` 与已受理的流程仅进入查账路径，临时查询失败不触发写入。如果进程在记录 `SUBMITTING` 后、实际派发前退出，系统会保守地保持 `UNKNOWN`，等待原操作核对。当前没有后台对账调度，也没有支付渠道到账确认。
+
+### 回归与评测
+
+- 最终全库回归 `.venv/Scripts/python.exe -m pytest -q -m 'not real' --tb=short -rs` 为 **265 passed、1 skipped、5 deselected、1 warning**，耗时 210.49 秒。跳过项为未开启的 Chinese-CLIP 本地模型测试，5 项真实 API 测试按标记排除。前一轮 `test_MM12_collection_spaces_are_separate` 出现一次 Chroma HNSW 读取错误，单独复跑该文件 4 项通过，最终全库复跑也通过。
+- `.venv/Scripts/python.exe -m pytest -q tests/test_acceptance.py tests/test_refund_result_guard.py tests/test_refund_status.py tests/test_openai_adapter.py tests/integration/harness tests/test_integration.py tests/test_trace_contract.py tests/test_local_sdk_smoke.py -m 'not real' --tb=short -rs` 通过 106 项，覆盖 T01–T20、真实本地 BGE 加载、FastMCP 与 LangGraph 确认恢复。
+- 故障注入覆盖假成功、缺少回执字段、回执编号/金额/状态冲突、权威记录归属/订单/金额/状态异常、提交后响应丢失、确定性拒绝、并发/重复确认、进程退出、查询暂时不可用和模型尝试将未决结果写成成功。资料来自隔离 SQLite、MCP 和 Trace。
+- `.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/workflow.jsonl --mode deterministic --agent-release refund-verified-final` 通过 10/10，`PASS`，运行 ID `run-bb61dca59eed31bf3ee692f6`。与同一数据集基线 `run-509c16394c7fed7ca6619773` 相比，工作流通过率持平，无新增失败。
+- `.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/safety.jsonl --mode deterministic --agent-release refund-verified-final` 通过 4/4，`PASS`，运行 ID `run-0cb69318f2d61a7d5db601d6`。两套数据的重复退款和越权副作用均为 0。确定性评测使用 Fake 模型。
+- 本地 manifest 修订为 BGE-M3 `5617a9f61b028005a4858fdac845db406aefb181`、BGE reranker `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`。现有真实本地模型烟测核对了 1024 维 Embedding 与 reranker 评分。真实主 LLM、Judge 与外部 VLM 本次未调用。
+- `uv lock --check` 通过。
+
+改动文件为 `app/refund_workflow.py`（新增）、`app/business.py`、`app/agent.py`、`app/agent_loop.py`、`app/main.py`、`app/mcp.py`、`app/evaluation.py`、`app/harness/policy_guard.py`、`app/harness/recovery.py`、`app/harness/runtime.py`、`app/harness/tool_executor.py`、`tests/test_refund_result_guard.py`、`tests/test_openai_adapter.py`、`tests/integration/harness/test_loop_recovery.py`、`tests/integration/harness/test_runtime.py` 与本报告。
+
+## 退款工具边界调整（2026-11-21）
+
+MCP 工具只向主 Agent 提供调用入口。FastMCP v4 注册 `begin_refund_workflow(order_id)`，移除原 `submit_refund_request` 注册、Gateway 能力参数与 Business 工具分发。Gateway 将会话与 Invocation 绑定到签名请求头。Business 在 SQLite 事务内创建并关联预览，API 验证预览回执后持久化 LangGraph 确认中断。确认凭据只交给当前用户，模型和 Trace 收到脱敏结果。
+
+确认后的 Workflow 直接调用 `Business.submit()`，再通过 `Business.refund_outcome()` 按原幂等键独立核验。首次确认和重复确认均可在 MCP 地址不可用时完成。提交 Trace 使用 `workflow.commit.*`，评测按提交阶段的事件统计实际提交次数。退款资格查询仍可由主 Agent 单独调用，预览阶段由 Business 直接校验资格。
+
+- T06 注入内部提交成功后的结果丢失，验证重复确认得到同一个已核验申请且退款记录增量为 1。HTTP 测试运行独立 FastMCP 进程，验证只有 `begin_refund_workflow` 在退款发起边界注册，旧提交调用被拒绝，缺少签名会话上下文或 Invocation 无效时无法生成预览。
+- 全库命令 `.venv/Scripts/python.exe -m pytest -q -m 'not real' --tb=short -rs` 为 **265 通过、1 跳过、5 排除、1 警告**，耗时 296.10 秒。T01–T20 与真实本地 BGE 烟测通过。跳过项是可选的 Chinese-CLIP 离线模型测试，5 项真实 API 测试按标记排除。
+- 定向测试命令为 `.venv/Scripts/python.exe -m pytest -q tests/test_acceptance.py tests/test_refund_result_guard.py tests/test_refund_status.py tests/test_integration.py tests/test_openai_adapter.py tests/test_trace_contract.py tests/integration/harness tests/unit/harness -m 'not real and not models' --tb=short`，123 通过、1 排除。
+- `.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/workflow.jsonl --mode deterministic --agent-release refund-mcp-boundary` 为 10/10，运行 ID `run-4d6af56565b09dfe0f1fe0d2`。工作流集将预览工具断言更新为 MCP `begin_refund_workflow`，原数据摘要因此不同。
+- `.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/safety.jsonl --mode deterministic --agent-release refund-mcp-boundary` 为 4/4，两套评测的重复退款与越权副作用均为 0。比较命令为 `.venv/Scripts/python.exe -m scripts.compare_runs --baseline run-0cb69318f2d61a7d5db601d6 --candidate run-b1490b146278e0c0adf2a63a`，门禁 PASS，逐案结果无变化。
+- `.venv/Scripts/python.exe -m scripts.run_eval --dataset datasets/harness_context.jsonl --mode deterministic --agent-release refund-mcp-boundary` 为 2/2，运行 ID `run-95487976e7ea5ddc38aacd8e`，验证从历史订单引用进入 MCP 退款预览的链路。
+- `uv lock --check` 通过。未更新依赖或数据库表结构。本地 BGE-M3 修订为 `5617a9f61b028005a4858fdac845db406aefb181`，BGE reranker 修订为 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`。

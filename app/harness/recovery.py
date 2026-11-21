@@ -18,9 +18,3 @@ async def backoff(ctx,attempt,telemetry,code,sleep=asyncio.sleep):
     await sleep(duration)
     ctx.remaining()
     telemetry.emit('recovery.completed',error_class=error_class(code),action='retry',result='ready')
-
-def reconcile_refund(business,ctx,wid,telemetry):
-    telemetry.emit('recovery.started',error_class='WRITTEN_BUT_RESPONSE_UNKNOWN',action='lookup_original_operation',workflow_id=wid)
-    result=business.refund_outcome(ctx.principal,wid)
-    telemetry.emit('recovery.completed',error_class='WRITTEN_BUT_RESPONSE_UNKNOWN',action='lookup_original_operation',result='found' if result else 'unknown',workflow_id=wid)
-    return result
