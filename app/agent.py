@@ -73,18 +73,19 @@ def resolve_order(text, bound_order, order_ids):
 class Agent:
     def __init__(self,business,gateway,config=settings,rag=None):
         self.b,self.gateway,self.config=business,gateway,config
-        self.skills=SkillManager(); self.rag=rag or RAG(business.db,config=config)
+        self.skills = SkillManager()
+        self.memory_resources = rag if rag is not None else RAG(
+            business.db, config=config.model_copy(update={'chroma_path': config.memory_chroma_path}),
+        )
         from app.multimodal.images import ImageRepository
         self.images = ImageRepository(business, config)
-        from app.multimodal.index import MultimodalIndex
-        self.multimodal_index = MultimodalIndex(self.images, self.rag.client)
-        from app.multimodal.retrieval import MultimodalRetrievalService
-        self.multimodal = MultimodalRetrievalService(self.multimodal_index)
+        from app.multimodal.retrieval import MultimodalEvidence
+        self.multimodal = MultimodalEvidence(self.images)
         self.refunds = RefundWorkflow(business, config.checkpoint_db_path)
         self._llm_client=None
         from app.harness.runtime import HarnessFacade
         self.harness=HarnessFacade(self)
-        self.memory = MemoryService(business, self.rag, config,
+        self.memory = MemoryService(business, self.memory_resources, config,
                                     lambda mode: self.harness.fake_model if mode == 'deterministic' else self.harness.model)
     def llm(self):
         if not all((self.config.llm_api_key,self.config.llm_base_url,self.config.llm_model or self.config.vlm_model)):
@@ -96,8 +97,10 @@ class Agent:
         return self._llm_client
     async def close(self):
         await self.harness.close()
+        if self.gateway is not None:
+            await self.gateway.close()
         if self._llm_client is not None: await self._llm_client.close()
-        self.rag.close()
+        self.memory_resources.close()
     async def chat(self,a,conv,text,mode='real',skill_mode='selected',request_id=None):
         return await self.harness.invoke_chat(principal=a,conversation_id=conv,message=text,mode=mode,skill_mode=skill_mode,client_request_id=request_id,legacy=True)
     async def _chat(self,a,conv,text,mode,skill_mode,ctx,services):

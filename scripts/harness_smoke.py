@@ -21,7 +21,10 @@ async def smoke():
         root=Path(folder)
         config=settings.model_copy(update={'sqlite_url':'sqlite:///'+str(root/'app.db'),'checkpoint_db_path':str(root/'cp.db'),'chroma_path':str(root/'chroma'),'bm25_index_path':str(root/'bm25'),'llm_api_key':'','llm_base_url':'','llm_model':''})
         db=DB(config.sqlite_url); db.seed(); b=Business(db); actor=Actor('user_a','a'); conv=b.conversation(actor)['id']
-        gateway=Gateway(b,config,create_mcp(b,config.mcp_service_secret,testing=True)); rag=RAG(db,FakeModels(),config); rag.build('knowledge')
+        from app.retrieval_mcp import RetrievalService, create_retrieval_mcp
+        rag=RAG(db,FakeModels(),config); rag.build('knowledge')
+        retrieval=create_retrieval_mcp(RetrievalService(b,config,rag=rag),config)
+        gateway=Gateway(b,config,create_mcp(b,config.business_secret,testing=True),retrieval_server=retrieval)
         agent=Agent(b,gateway,config,rag)
         try:
             ordinary=await agent.chat(actor,conv,'耳机保修多久','deterministic')

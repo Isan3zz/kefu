@@ -10,8 +10,8 @@
       },
       "user_message": "推荐一款适合我的耳机。",
       "required_checks": [
-        "memory.search_completed matched_count>=1",
-        "ContextManager 的 USER_MEMORY 实际包含至少一条属于 user_a 的有效耳机画像",
+        "memory.profile_loaded matched_count=4",
+        "ContextManager 的 USER_MEMORY 包含 user_a 的全部四条有效耳机画像",
         "至少调用一次 search_products，且未调用不相关的订单/退款写工具",
         "根据实时商品事实，推荐结果优先选择 yt-office-headset；不可虚构价格、库存和型号功能"
       ],
@@ -66,6 +66,7 @@
       },
       "user_message": "这次预算只有200元，推荐一款适合我的耳机。",
       "required_checks": [
+        "USER_MEMORY 完整注入四条历史画像",
         "当前轮明确预算 200 元优先于历史画像中的 500 元",
         "已推荐的商品必须实付展示价不高于200元且库存大于0",
         "不能谎称 200 元以内存在同时满足头戴式、ANC、双设备连接的商品"
@@ -74,7 +75,7 @@
         "current_budget_max_cents": 20000,
         "full_requirements_candidate_count": 0
       },
-      "note": "当前代码在存在明确当轮预算时可能跳过记忆召回，这是预期的优先级行为；本用例不是记忆注入正例。"
+      "note": "同时检查完整画像注入和实际预算上限，区分提示词优先级与后端价格约束。"
     },
     {
       "case_id": "profile-unrelated-004",
@@ -85,6 +86,7 @@
       },
       "user_message": "订单 O1002 的物流到哪了？",
       "required_checks": [
+        "USER_MEMORY 完整注入四条历史画像",
         "应调用 track_shipment，order_id=O1002",
         "不因为耳机画像而改走商品推荐",
         "回答中不应无关提及预算、头戴式等用户偏好"

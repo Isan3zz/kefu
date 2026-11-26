@@ -126,6 +126,34 @@ def test_order_oracle_records_actual_and_expected_for_all_boundary_cases(tmp_pat
     db.engine.dispose()
 
 
+async def test_order_chat_shows_items_and_latest_status_per_tracking_number(env):
+    clock = lambda: datetime.fromisoformat(FIXTURE_TIME)
+    for order_id in ('O3007', 'O3011'):
+        seed_order_scenario(env['db'], 'orders_boundary:' + order_id, clock)
+    with env['db'].tx() as connection:
+        connection.execute(shipments.insert().values(id='second-parcel', order_id='O3011', carrier='模拟快递',
+            tracking_no='PARCEL2', status='已签收', updated_at=FIXTURE_TIME))
+
+    agent, actor, conversation = env['agent'], env['a'], env['conv']
+    empty = await agent.chat(actor, conversation, '查询订单 O3007', 'deterministic')
+    assert [action['name'] for action in empty['tool_actions']] == ['get_order']
+    assert empty['tool_actions'][0]['result']['data']['shipments'] == []
+    assert '云听 Travel 长续航降噪耳机 × 2' in empty['answer'] and '实付 1098.00 元' in empty['answer']
+    assert '暂无物流记录' in empty['answer']
+
+    split = await agent.chat(actor, conversation, '查询订单 O3011', 'deterministic')
+    data = split['tool_actions'][0]['result']['data']
+    assert [row['status'] for row in data['shipments']] == ['已签收', '运输中']
+    assert '已签收' in split['answer'] and '运输中' in split['answer']
+    assert '揽收' not in split['answer'] and 'PARCEL2' not in split['answer']
+
+    detail = await agent.chat(actor, conversation, '查 O3011 的物流单号', 'deterministic')
+    assert [action['name'] for action in detail['tool_actions']] == ['track_shipment']
+    assert 'PARCEL2' in detail['answer'] and 'DEMOO3011' in detail['answer']
+    with env['db'].tx() as connection:
+        assert connection.scalar(select(func.count()).select_from(refund_requests)) == 0
+
+
 @pytest.mark.asyncio
 async def test_eval_case_selects_boundary_fixture_and_uses_refund_delta(tmp_path):
     case_with_seed_refund = {

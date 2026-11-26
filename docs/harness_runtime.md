@@ -38,7 +38,7 @@ API Auth 生成可信 Principal，Facade 校验归属并创建 frozen ExecutionC
 
 模型请求只有 app/harness/model_gateway.py 一处 SDK create 调用。动作决策、知识回答和可选 Judge 共用它；Agent.llm 仅为缓存客户端工厂。底层 SDK max_retries=0。默认 JSON 指令加严格 Pydantic 校验，不假定所有兼容 API 支持原生 JSON 模式；有明确支持时可设 MODEL_JSON_MODE=true。
 
-`complete_with_tools` 使用原生 SDK 响应，保留工具 ID 并返回匹配的 `ToolMessage`。服务端解析订单指代、检查参数和主体；直接提交退款不在目录中。`load_skill`、RAG 和退款预览都使用受控内部适配器；Skill 内容不授予权限。HTTP 提供方明确拒绝工具协议时返回 `MODEL_TOOL_CALLING_UNSUPPORTED`，不以文本 JSON 代替工具调用。
+`complete_with_tools` 使用原生 SDK 响应，保留工具 ID 并返回匹配的 `ToolMessage`。服务端解析订单指代、检查参数和主体。`load_skill` 走 SkillManager。退款预览、RAG 和图文检索均经 ToolExecutor 和统一 MCP Gateway。直接提交退款只在确认后的 Workflow 内执行。HTTP 提供方明确拒绝工具协议时返回 `MODEL_TOOL_CALLING_UNSUPPORTED`。
 
 | 情况 | 策略 |
 |---|---|

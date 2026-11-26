@@ -13,18 +13,23 @@ class KnowledgeQuery(Arguments):
     query:str=Field(min_length=1,max_length=1000)
     product_id:str|None=Field(default=None,min_length=1,max_length=100)
 
-INTERNAL_SCHEMAS={'load_skill':SkillName,'search_knowledge':KnowledgeQuery, **TOOL_ARGS}
-SCHEMAS={'get_orders':ListOrders,'get_order':Order,'track_shipment':Order,'search_products':Products,'check_refund_eligibility':Order,'create_ticket':Ticket,'begin_refund_workflow':Order}
-READ_TOOLS=frozenset(SCHEMAS)-{'create_ticket','begin_refund_workflow'}
+INTERNAL_SCHEMAS={'load_skill':SkillName}
+SCHEMAS={'get_orders':ListOrders,'get_order':Order,'track_shipment':Order,'search_products':Products,'check_refund_eligibility':Order,'create_ticket':Ticket,'begin_refund_workflow':Order,
+         'search_knowledge':KnowledgeQuery, **TOOL_ARGS}
 
 class PolicyGuard:
     def __init__(self,business,skills,config): self.b,self.skills,self.config=business,skills,config
     def deny(self,telemetry,rule,tool):
         telemetry.emit('policy.denied',rule_id=rule,proposed_action=tool,side_effect_happened=False,status='blocked',error_code='POLICY_DENIED')
         raise HarnessFailure('POLICY_DENIED','当前操作未获授权，请通过受控业务流程处理',source='tool',details={'rule_id':rule})
-    def check(self,ctx,budget,telemetry,skill_name,tool_name,arguments,*,internal=False):
+    def check(self,ctx,budget,telemetry,skill_name,tool_name,arguments,*,internal=False,
+              tool_call_id=None,operation_id=None,direct_image=False):
         ctx.remaining()
-        with self.b.db.tx() as c: self.b.owned(c,conversations,ctx.principal,ctx.conversation_id)
+        if direct_image:
+            if internal or ctx.conversation_id is not None or ctx.workflow_id is not None or tool_name not in TOOL_ARGS:
+                self.deny(telemetry,'DIRECT_IMAGE_SCOPE',tool_name)
+        else:
+            with self.b.db.tx() as c: self.b.owned(c,conversations,ctx.principal,ctx.conversation_id)
         if budget.tool_calls>=self.config.agent_max_tool_calls: raise HarnessFailure('STEP_LIMIT_EXCEEDED')
         schemas=INTERNAL_SCHEMAS if internal else SCHEMAS
         if tool_name not in schemas: self.deny(telemetry,'TOOL_NOT_ALLOWED',tool_name)
@@ -38,5 +43,6 @@ class PolicyGuard:
         version=None
         if ctx.workflow_id: version=self.b.workflow(ctx.principal,ctx.workflow_id)['version']
         budget.action(tool_name,validated,version,self.config.repeated_action_limit)
-        telemetry.emit('policy.checked',tool_name=tool_name,rule_id='TRUSTED_SCOPE_AND_TOOL_ALLOWLIST')
+        telemetry.emit('policy.checked',tool_name=tool_name,rule_id='TRUSTED_SCOPE_AND_TOOL_ALLOWLIST',
+                       tool_call_id=tool_call_id,operation_id=operation_id)
         return validated

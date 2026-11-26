@@ -43,6 +43,7 @@ async def test_gateway_exception_has_actual_tool_evidence(env,monkeypatch):
     monkeypatch.setattr(env['gateway'],'_call',fail)
     response=await env['agent'].chat(env['a'],env['conv'],'查订单 O1001','deterministic')
     assert response['error_code']=='UPSTREAM_UNAVAILABLE'
+    assert response['answer']=='查询结果未能确认，请核对信息后重试。'
     record=payloads(env)[0]; tool=[e for e in record['events'] if e['type']=='tool'][0]
     assert tool['name']=='get_order' and tool['args']=={'order_id':'O1001'}
     assert tool['status']=='error' and tool['error_code']=='UPSTREAM_UNAVAILABLE'

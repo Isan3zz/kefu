@@ -14,6 +14,7 @@ from app.db import traces, uid, now
 
 active_trace = ContextVar("active_trace", default=None)
 evaluation_context = ContextVar('evaluation_context',default={})
+retrieval_diagnostics = ContextVar('retrieval_diagnostics', default=None)
 
 @contextmanager
 def evaluation_scope(run_id,case_id):
@@ -111,5 +112,10 @@ class TraceRecorder:
         return self.payload
 
 def emit(kind, **data):
+    diagnostics = retrieval_diagnostics.get()
+    if diagnostics is not None and kind in ('retrieval.stages', 'multimodal.search.candidates', 'multimodal.search.completed'):
+        diagnostics.update({key:data[key] for key in (
+            'candidate_count', 'model_revision', 'knowledge_snapshot', 'stages',
+        ) if key in data})
     recorder = active_trace.get()
     if recorder is not None: return recorder.emit(kind, **data)

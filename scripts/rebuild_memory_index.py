@@ -12,7 +12,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     db = DB(settings.sqlite_url)
-    rag = RAG(db, config=settings)
+    rag = RAG(db, config=settings.model_copy(update={'chroma_path': settings.memory_chroma_path}))
     try:
         service = MemoryService(Business(db), rag, settings)
         count = service.rebuild_index(args.dry_run)

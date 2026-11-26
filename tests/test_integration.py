@@ -55,13 +55,14 @@ async def test_http_fastmcp_actor_boundary(env,http_mcp):
         r=await client.call_tool('get_orders',{})
         result=decode_tool_result(r)
         assert not result['ok'] and result['error']['code']=='FORBIDDEN'
-    token=sign_actor(env['a'],http_mcp.mcp_service_secret)
+    token=sign_actor(env['a'],http_mcp.mcp_service_secret,scope={'tool':'begin_refund_workflow'})
     async with Client(StreamableHttpTransport(http_mcp.mcp_base_url,headers={'X-Internal-Auth':'Bearer '+token})) as client:
         result=decode_tool_result(await client.call_tool('begin_refund_workflow',{'order_id':'O1001'}))
         assert not result['ok'] and result['error']['code']=='FORBIDDEN'
         forbidden=await client.call_tool('submit_refund_request',{'workflow_id':'wf-unused'},raise_on_error=False)
         assert forbidden.is_error
-    token=sign_actor(env['a'],http_mcp.mcp_service_secret,refund_preview_scope=(env['conv'],'invalid-invocation'))
+    token=sign_actor(env['a'],http_mcp.mcp_service_secret,refund_preview_scope=(env['conv'],'invalid-invocation'),
+                     scope={'tool':'begin_refund_workflow'})
     async with Client(StreamableHttpTransport(http_mcp.mcp_base_url,headers={'X-Internal-Auth':'Bearer '+token})) as client:
         result=decode_tool_result(await client.call_tool('begin_refund_workflow',{'order_id':'O1001'}))
         assert not result['ok'] and result['error']['code']=='NOT_FOUND'

@@ -1,4 +1,4 @@
-"""Rebuild or retry the local catalog index. Stop API writers before running."""
+"""Rebuild or retry the local catalog index. Stop Retrieval MCP on this Chroma path first."""
 import argparse
 import json
 from pathlib import Path

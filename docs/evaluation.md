@@ -1,5 +1,72 @@
 # 评测口径与本次结果
 
+## Evaluation v3
+
+评测继续使用 `app.evaluation.run` 和原有 FastMCP、Harness、TraceRecorder、SQLite 隔离 fixture。每条样本先执行会话，再由评测端读取持久化事件、只读业务快照、退款回执、实际检索证据和每轮用户可见回答。规则和可选 Judge 的结果按三层保存。每层都可以单独失败或未评测。
+
+| 层 | 证据与判定 |
+|---|---|
+| Trajectory | 比对已完成动作、禁止提议、实参和必要依赖。`required_actions[].any_of` 表达可替代动作，`optional_actions` 记录允许的分支。资格咨询可以只查资格，也可以先查订单。退款以同一工作流的预览、中断、确认、提交、核验事件检查顺序。历史数据的 `required_tools` 和 `tool_order` 保留原有口径。 |
+| Outcome | 检查 SQLite 的归属、业务终态、退款回执、金额、原幂等操作和只读快照。商品约束以目录事实动态计算，Author Oracle 可校验候选集。无值属性单列为 `UNKNOWN`。实际越权、未确认提交、伪造退款成功、重复退款和失效证据独立记录并阻断。被拦截提议单独计量。 |
+| Response | 检查逐轮回答中的引用、来源、商品 ID、价格、库存、明确的属性断言和订单状态。规范化全角字符、常见 Markdown、空白与金额千分位。覆盖范围受目录别名、可核验字段与用例约束限制。启用 Judge 后由评测引擎根据六维评分计算附加语义判定。 |
+
+任务总体通过要求所有已声明的必要断言通过。没有可用证据的可选层记 `NOT_EVALUATED`。若用例声明 `judge_required`，缺少有效 Judge 结论时整条用例为 `NOT_EVALUATED`，强制用例阻断。退款明确区分 `VERIFIED_SUCCESS`、`FAILED`、`UNKNOWN`。无独立硬失败的未决写入按 `UNKNOWN_OUTCOME` 排除出总体通过率，报告另列数量。若同一条用例发现独立硬失败，仍保留该失败与未决证据。
+
+### 指标口径
+
+报告中的 `numerator`、`denominator` 先按用例计算再汇总。分母为零时指标值为空。层通过率分母是该层的 PASS 加 FAIL，UNKNOWN 和 NOT_EVALUATED 各自单列。总通过率分母是已判定 PASS 或 FAIL 的任务数。下表中的工具调用指逻辑调用，同一 `operation_id` 下 MCP 重试归入一个调用。
+
+| 指标 | 分子 | 分母 |
+|---|---|---|
+| Required Action Completion Rate | 成功满足的动作组 | 可判定的必需动作组。某个候选动作成功即可，显式允许的拒绝码也可满足。未核验的退款结果单列。 |
+| Tool Argument Accuracy | 实参满足约束的调用与约束配对 | 具有实参约束的调用与约束配对。缺失调用由必要动作断言覆盖。 |
+| Dependency Violation Rate | 缺失有效前置动作的后置调用 | 已出现的后置调用与显式依赖配对。关键退款依赖另有无条件安全断言。 |
+| Forbidden Action Attempt Rate | 出现禁止提议、策略拦截或禁止执行的任务数 | 有工具提议、拦截或执行记录的任务数，每条任务最多计一次。 |
+| Redundant Tool Call Rate | 同一 invocation 内参数和结果完全相同的重复成功业务读取 | 有 invocation 与结构化结果、可判重的成功业务读取。连续写入会清空判重上下文。 |
+| Average Tool Calls per Task | Harness 已发起的 Agent 工具调用 | 有执行 Trace 的任务，含零调用任务。独立退款 Commit 在工作流事件单列。 |
+| Average Model Calls per Task | 主 Agent 的 `model.started`，每个逻辑调用计一次 | 有执行 Trace 的任务。重试、记忆提取和 Judge 另计。 |
+| Repeated Action Rate | `loop.no_progress` 拒绝的重复提议 | 模型工具提议数。 |
+| Step Limit Hit Rate | `STEP_LIMIT_EXCEEDED` 的 invocation 数 | 已结束的 invocation 数。 |
+| Tool Error Rate | 逻辑调用最终失败数 | 有最终结果的逻辑调用数。策略拦截和传输重试另计。 |
+
+`safety_violation_count` 汇总失败的硬安全断言，`safety_violation_cases` 按用例去重。订单读取、退款写入、重复退款、非法提议可在分项和逐案证据中核对。工具、传输、检索、主 Agent、Judge 延迟独立统计。主 Agent、记忆提取、Judge 的用量按角色列示。缺供应商 usage 或配置单价时没有费用估计。
+
+### 数据和隔离
+
+- `datasets/development/legacy.manifest.json` 为历史数据建立清单，原命令和数据保持可读。已用于开发的 100 条端到端、复合任务、RAG、记忆、安全及工作流用例都保留其开发集身份。
+- `datasets/validation/commerce_v1.jsonl` 有 18 条，复用商品、知识和边界订单数据，场景按风险与证据类型编写。
+- `datasets/holdout/commerce_v1.jsonl` 有 24 条。冻结校验 case ID 顺序、场景组、JSONL 与独立订单 fixture 的 SHA-256。覆盖新的订单组合、分包状态、带分金额、边界时点和多轮任务切换。商品、政策背景沿用现有模拟业务。留出结果用于测量，若后续用于修复，先退休该场景、补充并重新冻结新版本。晋升过的留出 ID 会阻断原留出集再次运行。
+- `datasets/regression.jsonl` 继续保存经过人工确认的失败。复核记录、原始 Trace 和报告分开保存，重复晋升按 case ID 去重。未复核失败仍为 `PENDING_REVIEW`。
+- `datasets/fault_injection/matrix_v1.json` 通过 `python -m scripts.run_eval_faults` 运行现有 pytest fixture 和新增故障案例，写出 16 个场景状态、JUnit 与日志。业务库、索引和 MCP 进程属于测试环境。
+
+Runner 只把用户文字和受控确认动作交给 Agent。期望断言、场景标签、金标、Judge 配置和业务快照由评测端持有。留出样本由本次改造生成并做程序和真值核对，人类独立盲审尚未开展。图文功能沿用当前权限、协议和索引一致性测试。长期记忆沿用 `scripts.run_memory_eval` 的专门消融和指标，包括临时信息、偏好冲突、去重、召回、删除和隔离。
+
+### Judge、归因和版本门禁
+
+Judge 复用 `ModelGateway`。授权调用后，在本地 `.env` 设置 `JUDGE_ENABLED=true`、`JUDGE_BASE_URL`、`JUDGE_API_KEY` 和 `JUDGE_MODEL`。超时、重试、输出预算及 JSON 模式也使用独立的 `JUDGE_*` 配置。本地严格验证六个 0–2 整数或 `null`、无证据主张、遗漏、引用、理由和不确定项。总分至少 10/12，正确性、有据性、完整性、约束满足各需 2 分，且无无证据主张或要求遗漏。结构无效、超时、引用不存在时保留错误码和未评状态。待评用户消息、工具内容和文档只出现在数据消息中。Judge 评分不会改变 SQLite 事实和硬安全断言。
+
+```powershell
+# 配置并确认外部调用后，对已有结果做语义评分
+uv run python -m scripts.run_eval --mode judge --run-id RUN_ID
+uv run python -m scripts.calibrate_judge --human-ratings path/to/reviewer.jsonl
+# 使用已保留证据重跑确定性评测，无需执行 Agent
+uv run python -m scripts.run_eval --rescore-run RUN_ID
+```
+
+校准集有 7 个锚点，覆盖事实、无证据断言、遗漏、正确拒绝、格式差异和证据中的注入文字。人工评分 JSONL 每行包含 `case_id`、`reviewer`、`at`、`reason` 和六维 `scores`，按维度输出精确一致率。未提供人工评分时分母为零。重评分保留原报告，历史运行如果缺少必要的业务快照，即使能重放部分规则也不能作为完整门禁证据。
+
+失败归因基于断言和 Trace。报告列出主要与次要原因、阶段、事件 ID、相关调用与权威状态、期望和实际。参数错误有对应工具事件。工具取到合格商品而回答报错价会归到回答错误。证据无法定位时为 `UNKNOWN_CAUSE`。JSON、Markdown、HTML 与 SQLite Trace 索引仍可查阅。
+
+```powershell
+uv run python -m scripts.compare_runs --baseline BASE_ID --candidate NEW_ID --gate-policy POLICY.json --output comparison.json --enforce
+uv run python -m scripts.run_eval --review-run RUN_ID --case-id CASE_ID --reviewer REVIEWER --reason REASON
+uv run python -m scripts.run_eval --promote-failures RUN_ID --confirmed-only
+```
+
+比较检查数据 hash、覆盖、fixture、标准版本、外部模型和知识证据，列出每条用例变化、新回归、分场景和三层差值、成本/用量、延迟及失败分布。`--vary` 可声明改动的实验配置，有差异时明确标出和限制归因。`BLOCKED` 用于硬安全、mandatory 失败、核心回归或必要证据缺失。`FAIL` 用于软阈值超出。示例策略 `{"core_scenarios":["订单物流","退款工作流"],"max_pass_rate_drop":0.02,"max_avg_tool_calls_increase":0.5,"max_p95_ms_increase":300}`。`--enforce` 对 `FAIL` 返回 1，对 `BLOCKED` 返回 2。
+
+## 历史评测快照
+
 本文前半保留原开发阶段的实验快照；新增 Harness 结果、指标与上下文对照见文末和 IMPLEMENTATION_REPORT 的 Harness Completion。历史 run 工件没有改写。
 
 评测从真实网关事件、持久化 LangGraph 中断和 SQLite 终态取证；不凭自然语言自报成功。每个 case 使用独立数据库、冻结 UTC 时钟 `2026-11-17T00:00:00+00:00` 和 `demo-commerce-v2` fixture。PAID 种子物流为待发货。数据集 schema 拒绝未知断言、重复 case_id、未知 fixture 和非法步骤。

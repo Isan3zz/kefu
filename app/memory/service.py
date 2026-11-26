@@ -36,9 +36,10 @@ class MemoryService:
     def event(self, kind, **attributes):
         recorder = active_trace.get()
         if recorder is not None and self.config.harness_trace_enabled:
-            attrs = {'embedding_version': self.index.version, **attributes}
+            if 'embedding_version' not in attributes:
+                attributes['embedding_version'] = self.index.version
             emit('memory.' + kind, memory_pipeline_version=PIPELINE_VERSION,
-                 tenant_id=recorder.actor.tenant_id, **attrs)
+                 tenant_id=recorder.actor.tenant_id, **attributes)
 
     def consent_snapshot(self, principal):
         if not self.config.memory_enabled:
@@ -144,6 +145,23 @@ class MemoryService:
             self.event('search_failed', status='error', error_type=type(error).__name__,
                        error_code='MEMORY_INDEX_SYNC_ERROR', duration_ms=(time.perf_counter() - started) * 1000)
             return []
+
+    def load_profile(self, principal):
+        if not self.config.memory_enabled:
+            return []
+        try:
+            with self.db.tx() as connection:
+                if not self.repository.settings(connection, principal)['retrieval_enabled']:
+                    return []
+                query = self.repository.active_rows(connection, principal).order_by(memories.c.subject_key)
+                rows = connection.execute(query).mappings()
+                items = [retrieved(row) for row in rows if not prohibited(row['content'])]
+        except Exception as error:
+            self.event('profile_load_failed', status='error', error_type=type(error).__name__, embedding_version=None)
+            return []
+        self.event('profile_loaded', matched_count=len(items), memory_ids=[item.memory_id for item in items],
+                   embedding_version=None)
+        return items
 
     def _search(self, principal, query, limit, token_budget):
         limit = min(limit, self.config.memory_top_k)

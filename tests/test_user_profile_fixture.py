@@ -150,7 +150,7 @@ def captured_memory(captures):
 
 
 def case_report(case_id, result, trace, captures, expected=None):
-    search_events = events(trace, "memory.search_completed")
+    search_events = events(trace, "memory.profile_loaded")
     injections = events(trace, "memory.context_injected")
     safe_answer = result["answer"]
     for memory in captured_memory(captures):
@@ -210,11 +210,11 @@ def assert_no_private_memory_text(trace, profile):
 
 def assert_profile_injected(captures, profile):
     contents = {row["content"] for row in profile["memory_inputs"]}
-    prompts = [call for call in captures if call["payload"].get("USER_MEMORY")]
-    assert prompts
-    injected = [entry["content"] for call in prompts for entry in call["payload"]["USER_MEMORY"]]
-    assert contents.intersection(injected)
-    assert all(content not in call["system"] for content in contents for call in prompts)
+    assert captures
+    for call in captures:
+        assert {entry["content"] for entry in call["payload"].get("USER_MEMORY", [])} == contents
+        assert "必须按当轮要求执行" in call["system"]
+        assert all(content not in call["system"] for content in contents)
 
 
 def full_profile_matches(rows, profile, max_price_cents):
@@ -266,8 +266,7 @@ async def test_profile_fake_memory_context_live_products_budget_and_shipping(
                                 on_case["user_message"], mode="deterministic")
     on_trace = trace_payload(env, on_result)
     on_report = case_report(on_case["case_id"], on_result, on_trace, captured, on_case["gold"])
-    on_search = events(on_trace, "memory.search_completed")
-    assert on_search and max(event["matched_count"] for event in on_search) >= 1
+    assert events(on_trace, "memory.profile_loaded")[0]["matched_count"] == len(profile["memory_inputs"])
     assert_profile_injected(captured, profile)
     assert [action["name"] for action in on_result["tool_actions"]].count("search_products") == 1
     assert set(on_case["gold"]["forbidden_tools"]).isdisjoint(observed_tool_names(on_trace))
@@ -297,8 +296,8 @@ async def test_profile_fake_memory_context_live_products_budget_and_shipping(
                                     budget_case["user_message"], mode="deterministic")
     budget_trace = trace_payload(env, budget_result)
     budget_report = case_report(budget_case["case_id"], budget_result, budget_trace, captured, budget_case["gold"])
-    assert not events(budget_trace, "memory.search_completed")
-    assert not events(budget_trace, "memory.context_injected")
+    assert_profile_injected(captured, profile)
+    assert events(budget_trace, "memory.context_injected")
     assert "search_products" in observed_tool_names(budget_trace)
     assert full_profile_matches(load_product_fixture(), profile,
                                 budget_case["gold"]["current_budget_max_cents"]) == 0
@@ -316,8 +315,8 @@ async def test_profile_fake_memory_context_live_products_budget_and_shipping(
                                        unrelated_case["user_message"], mode="deterministic")
     unrelated_trace = trace_payload(env, unrelated_result)
     unrelated_report = case_report(unrelated_case["case_id"], unrelated_result, unrelated_trace, captured, unrelated_case["gold"])
-    assert not events(unrelated_trace, "memory.search_completed")
-    assert not events(unrelated_trace, "memory.context_injected")
+    assert_profile_injected(captured, profile)
+    assert events(unrelated_trace, "memory.context_injected")
     assert any(action["name"] == "track_shipment" and
                action["args"].get("order_id") == unrelated_case["gold"]["order_id"]
                for action in unrelated_result["tool_actions"])
@@ -381,18 +380,14 @@ async def test_profile_real_model_cases_record_trace_and_recommend_from_live_att
         on_case, on_result, on_trace, on_captures = await run_case("profile-on-001")
         if on_result:
             gold = profile["gold_profile"]
-            matched = [event for event in events(on_trace, "memory.search_completed")
-                       if event.get("matched_count", 0) >= 1]
+            matched = [event for event in events(on_trace, "memory.profile_loaded")
+                       if event.get("matched_count") == len(profile["memory_inputs"])]
             injected_ids = {ident for event in events(on_trace, "memory.context_injected")
                             for ident in event.get("memory_ids", [])}
             capture_ids = {entry["memory_id"] for entry in captured_memory(on_captures)}
-            if not matched or not injected_ids.intersection(capture_ids):
-                failures.append("profile-on-001: memory search/context injection was not observed")
-            if not any("USER_MEMORY" in call["payload"] for call in on_captures):
-                failures.append("profile-on-001: ContextManager did not put USER_MEMORY in the user payload")
-            if any(entry["content"] in call["system"] for call in on_captures
-                   for entry in captured_memory([call])):
-                failures.append("profile-on-001: profile text appeared in the system prompt")
+            if not matched or len(injected_ids) != len(profile["memory_inputs"]) or injected_ids != capture_ids:
+                failures.append("profile-on-001: complete profile load and context injection was not observed")
+            assert_profile_injected(on_captures, profile)
             names = observed_tool_names(on_trace)
             if "search_products" not in names or set(on_case["gold"]["forbidden_tools"]).intersection(names):
                 failures.append("profile-on-001: product read or tool-permission check failed")
@@ -427,8 +422,7 @@ async def test_profile_real_model_cases_record_trace_and_recommend_from_live_att
         budget_case = cases["profile-current-budget-003"]
         _, budget_result, budget_trace, budget_captures = await run_case("profile-current-budget-003")
         if budget_result:
-            if events(budget_trace, "memory.search_completed") or events(budget_trace, "memory.context_injected"):
-                failures.append("profile-current-budget-003: explicit current budget did not bypass long-term memory")
+            assert_profile_injected(budget_captures, profile)
             if "search_products" not in observed_tool_names(budget_trace):
                 failures.append("profile-current-budget-003: live product lookup was skipped")
             selected = selected_product_ids(budget_trace)
@@ -453,8 +447,7 @@ async def test_profile_real_model_cases_record_trace_and_recommend_from_live_att
                        action["args"].get("order_id") == shipping_case["gold"]["order_id"]
                        for action in shipping_result["tool_actions"]):
                 failures.append("profile-unrelated-004: expected shipment lookup for O1002 was not made")
-            if events(shipping_trace, "memory.search_completed") or events(shipping_trace, "memory.context_injected"):
-                failures.append("profile-unrelated-004: unrelated logistics query used headphone memory")
+            assert_profile_injected(shipping_captures, profile)
             if set(shipping_case["gold"]["forbidden_tools"]).intersection(observed_tool_names(shipping_trace)):
                 failures.append("profile-unrelated-004: unrelated product or refund tool was called")
             if re.search(r"预算|头戴式|耳机", shipping_result["answer"]):

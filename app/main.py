@@ -24,6 +24,13 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
     async def lifespan(app):
         worker = agent.memory.worker
         worker.stopping = False
+        if config.memory_enabled and rag is None:
+            try:
+                await asyncio.to_thread(agent.memory.index.queue_missing_projection, agent.memory.repository)
+            except Exception as error:
+                logging.getLogger(__name__).warning('Memory projection check failed: %s', type(error).__name__)
+            if config.memory_job_mode == 'sync':
+                await agent.memory.sync_index()
         task = asyncio.create_task(worker.serve()) if config.memory_job_mode == 'async' else None
         try: yield
         finally:
@@ -37,6 +44,7 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
     async def domain_error(request,e):
         status={'UNAUTHORIZED':401,'FORBIDDEN':403,'POLICY_DENIED':403,'NOT_FOUND':404,'INVALID_ARGUMENT':422,'LLM_NOT_CONFIGURED':503,'CONFIG_ERROR':503,'KNOWLEDGE_NOT_READY':503,'UPSTREAM_UNAVAILABLE':503,'TOOL_UPSTREAM_ERROR':503,'MODEL_UPSTREAM_ERROR':503,'MODEL_RATE_LIMIT':503,'MODEL_BAD_OUTPUT':502,'TOOL_BAD_RESULT':502,'SYSTEM_ERROR':500,'INTERNAL_ERROR':500,'TIMEOUT':504,'RUN_TIMEOUT':504,'MODEL_TIMEOUT':504,'TOOL_TIMEOUT':504}.get(e.code,409)
         status = ERROR_STATUS.get(e.code, status)
+        if e.code.startswith('MCP_'): status=503
         if e.code=='MODEL_TOOL_CALLING_UNSUPPORTED': status=503
         detail={'code':e.code,'message':e.message}
         if getattr(e,'invocation_id',None): detail.update(invocation_id=e.invocation_id,trace_id=e.trace_id)
@@ -55,8 +63,8 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
         return b.authenticate(authorization[7:])
     app.include_router(memory_router(agent.memory, actor, envelope))
     if config.multimodal_enabled:
-        app.include_router(image_router(agent.images, agent.multimodal_index, actor, envelope))
-        app.include_router(retrieval_router(agent.multimodal, actor, envelope))
+        app.include_router(image_router(agent.images, actor, envelope))
+        app.include_router(retrieval_router(agent.images, agent.harness.tools, actor, envelope))
 
         @app.get('/multimodal', include_in_schema=False)
         def multimodal_console():
@@ -72,7 +80,8 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
     def health():
         with db.tx() as c: c.exec_driver_sql('SELECT 1')
         from app.rag import local_models
-        return envelope({'db':'ok','models_loaded':local_models.cache_info().currsize>0})
+        return envelope({'db':'ok','models_loaded':local_models.cache_info().currsize>0,
+                         'models_loaded_scope':'api_memory'})
     class Input(BaseModel): model_config=ConfigDict(extra='forbid')
     class Login(Input): demo_user_key:str
     @app.post('/api/v1/auth/demo-login')
@@ -143,7 +152,7 @@ def create_app(config=settings,db=None,gateway=None,rag=None):
             return envelope(json.loads(r['payload']))
     @app.post('/api/v1/knowledge/rebuild')
     async def rebuild(a=Depends(admin)):
-        return envelope(await asyncio.to_thread(agent.rag.build,ROOT/'knowledge'))
+        return envelope(await agent.gateway.rebuild_knowledge(a))
     class Eval(Input): dataset:str; mode:Literal['deterministic','rag-real','agent-real']='deterministic'; agent_release:str='local'
     @app.post('/api/v1/evaluations/runs')
     async def evaluate(body:Eval,a=Depends(admin)):

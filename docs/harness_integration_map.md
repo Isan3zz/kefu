@@ -7,7 +7,8 @@
 | app/main.py | Auth、REST/SSE 契约、异常封装 | chat / stream / confirm 委托 HarnessFacade；透传 request_id；新增本人 invocation 查询 |
 | app/agent.py | StateGraph 节点、conv:/wf: thread、AsyncSqliteSaver、interrupt/Command、业务回执核对 | 注入 Harness services；唯一 ModelGateway；统一 ToolExecutor；决策步数；移除全局锁与节点 SDK 请求 |
 | app/skills.py + catalog | 原四技能发现/选择/懒加载、可信工具白名单 | 不重写；通过已有 Recorder 的适配事件关联 invocation |
-| app/mcp.py | 七工具、FastMCP Client/Server、HMAC actor、原返回 schema | 增加单次传输选项供 Harness 接管唯一重试层，旧直接调用兼容；识别 is_error |
+| app/mcp.py | Business 七工具、FastMCP Client/Server、HMAC actor、业务返回信封 | 统一路由 Business 与 Retrieval。按服务复用连接、核验 `list_tools`，由 ToolExecutor 管理读工具重试。 |
+| app/retrieval_mcp.py | RAG、Chroma、BM25、Chinese-CLIP、图文检索 | 提供五个独立的只读检索工具，返回结构化诊断，由原 Recorder 写入 Trace。 |
 | app/business.py | 所有归属、确认、事务、资格和退款幂等 | 不改变规则；Recovery 复用 refund_outcome 按原 operation_key 对账 |
 | app/rag.py | 本地 BGE、Chroma/BM25/RRF/rerank、知识治理与快照 | 不重写；节点补结构化检索/重排事件与证据上下文 |
 | app/observability.py | JSONL + SQLite 唯一 Trace 出口、脱敏、evaluation_scope | 扩展 schema 1.1 envelope 与 Harness 元数据，保留旧事件供旧评测消费 |

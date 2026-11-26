@@ -7,7 +7,7 @@ dependencies = [
  "aiosqlite", "langgraph", "langgraph-checkpoint-sqlite", "fastmcp<3",
  "chromadb", "sentence-transformers", "huggingface-hub", "rank-bm25",
  "jieba", "numpy", "pyyaml", "httpx", "openai", "tenacity", "sentencepiece",
- "pillow", "python-multipart", "filelock",
+ "pillow", "python-multipart", "filelock", "anyio",
 ]
 [dependency-groups]
 dev = ["pytest", "pytest-asyncio", "pytest-cov"]

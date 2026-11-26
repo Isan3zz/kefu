@@ -6,9 +6,9 @@
 | --- | --- |
 | FastAPI Bearer 认证、Harness `ExecutionContext.principal` | 记忆 API 只用认证身份；消息再查所属会话及 USER 角色。请求体、模型和 Skill 无法提交用户或租户字段。 |
 | `DB.tx()`、SQLite、Alembic | `0004` 新增授权、记忆、修订、pending、job、候选操作表；未改业务表。归档和入队同事务，入队失败通过 savepoint 隔离。 |
-| `RAG.model()` / `RAG.client()` | 同一个本地 BGE-M3 和 Chroma 客户端，独立 `customer_memories_v1` collection；显式传 1024 维向量，不启用 Chroma 默认 embedding。按需复用同一 BGE reranker。 |
-| Harness Model Gateway / Context Manager | 一批进行一次成功的结构化提取；重试有上限。召回只为推荐回复提供低信任数据，最多 5 条 / 600 估算 tokens；不进入意图、工具计划或退款确认。 |
-| LangGraph、Recorder、Evaluation | Agent Loop 在准备推荐上下文时最多召回一次，后续决策复用；使用前二次核验，实时商品仍走工具。`conv:`、`wf:` 线程约定不变。任务与聊天通过统一 Recorder 关联源 ID；原评测断言、版本比较、Trace JSONL 和 SQLite 索引继续复用。 |
+| 记忆向量 | 复用本地 BGE-M3 和 Chroma 实现，显式传入 1024 维向量。API 使用独立的 `MEMORY_CHROMA_PATH` 和 `customer_memories_v1` collection。启用语义重排时使用本地 BGE reranker。 |
+| Harness Model Gateway / Context Manager | 一批进行一次成功的结构化提取，重试有上限。默认 `MEMORY_CONTEXT_MODE=profile`，在模型上下文允许的范围内，把用户本人有效的完整画像放进 `USER_MEMORY`。画像作为低信任数据提供给模型。 |
+| LangGraph、Recorder、Evaluation | Agent Loop 每轮从 SQLite 读取画像一次，后续决策复用并在使用前核对版本和检索开关。实时商品仍走工具。`conv:`、`wf:` 线程约定不变。Trace 记录加载与实际注入的 ID，整体上下文超出预算时记录 `memory.profile_truncated`。 |
 
 ```
 归档 USER 消息 → 本地规则 (NOOP / REJECT / CANDIDATE / URGENT)
@@ -19,11 +19,11 @@
 
 默认 3 条合批，上限 6 条；空闲 120 秒、最长等待 300 秒、明确结束会话均可触发；`URGENT` 直接建批并唤醒 worker。5 秒轮询是调度间隔，不是端到端 SLA。`NOOP` 无 pending/job，也不调用提取模型。`MEMORY_JOB_MODE=sync` 只对已成批任务同步处理，适合测试，不对每轮调用模型。单 worker 崩溃后恢复持久任务；若外部模型成功但尚未提交 SQLite 就崩溃，可能重复调用，**写入效果幂等**，不承诺模型请求 exactly-once。
 
-查询先按租户和用户过滤 Chroma，再核对 SQLite 归属、版本、状态、授权和过期时间；失败回退无记忆。新旧预算冲突时采用当前用户明确的预算，并按**实时目录**库存与价格筛选。记忆不能证明商品具有未核实特性；订单、物流、政策与退款资格仍由原业务和 RAG 链路判断。
+画像按租户、用户、状态、有效期及检索设置读取。系统提示词要求当前明确要求优先，并只参考相关且相容的历史偏好。新旧预算冲突时采用当前用户明确的预算，并按**实时目录**库存与价格筛选。商品、订单、物流、政策与退款资格仍依赖原业务和 RAG 链路。`MEMORY_CONTEXT_MODE=semantic` 保留 Chroma 语义召回模式（最多 5 条和 600 估算 tokens），原记忆召回评测显式使用该模式。
 
 ## Swagger 演示
 
-1. 启动原 API 与 MCP，执行 `python -m alembic upgrade head`；使用模拟用户登录并携带 Bearer token。
+1. 执行 `python -m alembic upgrade head`，启动 API 与两个 MCP 服务，使用模拟用户登录并携带 Bearer token。
 2. `PATCH /api/v1/memories/settings` 请求体 `{"auto_write_enabled":true}`。然后在会话 A 以 `mode=real` 发送「请记住我买耳机优先关注降噪」。回复只表示已收到请求，等待列表出现条目才算保存成功。
 3. 离线可以替代步骤 2 的模型提取：`POST /api/v1/memories` 请求体 `{"memory_type":"preference","subject_key":"headphones.noise_cancellation","content":"我买耳机优先关注降噪"}`，再以 `mode=deterministic` 检索。这是手动写入，不声称离线模型提取了偏好。
 4. 创建全新会话 B，问「推荐一款耳机」，检查 `search_products` 的实时结果和偏好参考提示。现有商品数据未提供降噪时不会声称支持。
@@ -38,3 +38,4 @@
 - 删除时 SQLite 先屏蔽旧条目，清除正文、来源摘录和修订；即使 Chroma 清理失败也不会重新召回。为了防止旧批次写回，单条删除和自然语言遗忘请求也保守取消当前用户全部旧批次；自然语言不直接删除历史条目。
 - 这是应用层删除，不覆盖原聊天归档、已有回复、SQLite/Chroma 旧页和备份；不宣称物理擦除。生产级 DLP 不在范围内，保守规则不能识别所有敏感表达。已启用自动保存且使用外部主模型时，通过门禁的少量用户消息会发送给该模型供应商。
 - 索引失败由 `index_pending` 留待 worker 补偿。升级模型或恢复索引时先停 API worker；用 `python -m scripts.rebuild_memory_index --dry-run` 查范围，去掉参数后重建**记忆 collection**，不重建知识库。日常运行不下载模型权重。
+- 从旧的共享 Chroma 目录升级时，API 在新记忆 collection 缺失时重新排队 SQLite 中的有效记忆。后台重建期间，默认画像模式继续直接读取 SQLite。旧目录中的记忆向量副本仍在磁盘上，清理由部署维护方处理。

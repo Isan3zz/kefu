@@ -63,11 +63,14 @@ async def test_L02_L04_native_decision_observation_and_final(loop_chat):
     def observe(body):
         assistant, tool = body['messages'][-2:]
         assert assistant['tool_calls'][0]['id']==tool['tool_call_id']=='call_get_order'
-        assert json.loads(tool['content'])['data']['id']=='O1001'
-        return '已查到。'
+        data = json.loads(tool['content'])['data']
+        assert data['id']=='O1001'
+        assert data['items'][0]['product_name']=='云听耳机' and data['shipments'][0]['status']=='已签收'
+        return '订单 O1001 已送达，实付 299 元，商品是云听耳机 × 1，物流：已签收。'
     response,requests,trace,transcript=await loop_chat('查订单 O1001',[[call('get_order',{'order_id':'O1001'})],observe])
     assert [entry['stage'] for entry in trace['events'] if entry['type']=='llm']==['agent_loop','agent_loop']
     assert len(requests)==2 and [tool['name'] for tool in response['tool_actions']]==['get_order']
+    assert '云听耳机 × 1' in response['answer'] and '物流：已签收' in response['answer']
     assert isinstance(transcript[0],AIMessage) and isinstance(transcript[1],ToolMessage)
     assert transcript[0].tool_calls[0]['id']==transcript[1].tool_call_id
 
@@ -77,9 +80,9 @@ async def test_L03_multistep_knowledge_and_orders(env, loop_chat):
     def finish(body):
         observations = [json.loads(row['content']) for row in body['messages'] if row['role']=='tool']
         assert len(observations)==2 and observations[1]['data'][0]['id'].startswith('O')
-        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
-        assert facts['B1']['label']=='本人订单列表' and facts['K1']['label']=='知识证据'
-        return '为您整理如下：{{K1}}；另外，{{B1}}。'
+        chunk = observations[0]['data'][0]
+        assert 'reply_facts' not in json.loads(body['messages'][1]['content'])['current_task']
+        return f"售后政策可参考 [{chunk['chunk_id']}] v{chunk['version']}。另外，本次查到你的订单 O1001。"
     result, requests, trace, _ = await loop_chat('售后政策是什么？顺便查下我的订单',[
         [call('search_knowledge',{'query':'耳机退款政策'})],[call('get_orders')],finish])
     assert len(requests)==3 and 'O1001' in result['answer'] and result['citations']
@@ -87,40 +90,60 @@ async def test_L03_multistep_knowledge_and_orders(env, loop_chat):
     assert [row['name'] for row in trace['events'] if row['type']=='loop.tool_observed']==['search_knowledge','get_orders']
 
 
-async def test_business_reply_uses_model_composition_without_another_call(loop_chat):
-    def compose(body):
-        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
-        assert [facts[key]['label'] for key in ('B1','B2')]==['订单详情','物流']
-        return '给您汇总一下：{{B2}}；同时，{{B1}}。'
+async def test_business_reply_uses_model_text_without_another_call(loop_chat):
+    draft = '订单 O1002 已发货，云听耳机 1 副，实付 299 元。物流目前运输中。'
     result,requests,trace,_=await loop_chat('帮我总结 O1002 的订单和物流',[
-        [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O1002'})],compose])
+        [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O1002'})],draft])
     assert len(requests)==2
-    assert result['answer']=='给您汇总一下：订单 O1002 的物流状态：运输中（模拟快递）；同时，订单 O1002 已发货，实付 299.00 元。'
-    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_TEMPLATE'
+    assert result['answer']==draft
+    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_DIRECT'
 
 
 @pytest.mark.parametrize(('draft','reason'),[
-    ('{{B1}}；退款已到账，{{B2}}。','UNVERIFIED_TEXT'),
-    ('{{B1}}；{{B9}}。','INVALID_FACT_REFERENCES'),
-    ('{{B1}}。','MISSING_FACT_REFERENCES'),
-    ('{{B1}}；{{B1}}；{{B2}}。','INVALID_FACT_REFERENCES'),
+    ('按物流查询结果，O1002 退款已到账。','UNVERIFIED_WRITE_CLAIM'),
+    ('O1002 退款申请已经受理。','UNVERIFIED_WRITE_CLAIM'),
+    ('O1002 正在运输中。参见 [' + 'a'*24 + ']。','UNVERIFIED_CITATION'),
+    ('{{B1}}。','UNVERIFIED_ANSWER'),
 ])
-async def test_invalid_business_draft_falls_back_to_real_results(loop_chat,draft,reason):
+async def test_invalid_business_draft_reports_error_without_substituting_answer(loop_chat,draft,reason):
     result,_,trace,_=await loop_chat('查订单 O1002 和物流',[
         [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O1002'})],draft])
-    assert '已发货' in result['answer'] and '运输中' in result['answer']
-    assert '到账' not in result['answer'] and '{{' not in result['answer']
+    assert result['answer']=='暂未得到可核实的答复，请稍后重试。'
+    assert result['terminal_reason']=='ERROR'
     event = next(row for row in trace['events'] if row['type']=='loop.reply_composed')
-    assert event['mode']=='VERIFIED_FALLBACK' and event['validation']==reason
+    assert event['mode']=='REJECTED' and event['validation']==reason
 
 
 async def test_composed_partial_reply_does_not_claim_failed_shipment(loop_chat):
+    draft = '订单 O1002 已发货。物流查询暂未能确认，请稍后重试。'
     result,_,trace,_ = await loop_chat('查订单 O1002 和物流',[
         [call('get_order',{'order_id':'O1002'}),call('track_shipment',{'order_id':'O2001'})],
-        '为您汇总如下：{{B1}}。'])
-    assert '为您汇总如下：订单 O1002 已发货' in result['answer']
-    assert '查询结果未能确认' in result['answer'] and 'O2001' not in result['answer']
-    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_TEMPLATE'
+        draft])
+    assert result['answer']==draft and 'O2001' not in result['answer']
+    assert next(row for row in trace['events'] if row['type']=='loop.reply_composed')['mode']=='MODEL_DIRECT'
+
+
+async def test_shipping_and_knowledge_reply_explains_missing_tracking_directly(env, loop_chat):
+    from datetime import datetime
+    from app.dataset import FIXTURE_TIME
+    from app.order_fixtures import seed_order_scenario
+
+    seed_order_scenario(env['db'], 'orders_boundary:O3019', lambda: datetime.fromisoformat(FIXTURE_TIME))
+    env['rag'].build('knowledge')
+    def finalize(body):
+        shipping, knowledge = [json.loads(m['content']) for m in body['messages'] if m['role']=='tool']
+        assert shipping['data'][0]['tracking_no'] is None
+        chunk = knowledge['data'][0]
+        return f"O3019 正在运输中，当前暂无运单号。可以提供订单号请客服核实承运信息。 [{chunk['chunk_id']}] v{chunk['version']}。"
+
+    response, requests, trace, _ = await loop_chat('只查 O3019 物流，并告诉我没有运单号时应该怎么核实。', [
+        [call('track_shipment', {'order_id':'O3019'}), call('search_knowledge', {'query':'没有运单号如何核实物流'})],
+        finalize,
+    ])
+    assert len(requests)==2 and response['answer'].startswith('O3019 正在运输中，当前暂无运单号。')
+    assert '请客服核实承运信息' in response['answer']
+    assert all(chunk['content'] not in response['answer'] for chunk in response['citations'])
+    assert any(e['type']=='loop.reply_composed' and e['mode']=='MODEL_DIRECT' for e in trace['events'])
 
 
 async def test_L05_L21_bad_json_observed_and_failure_not_fabricated(loop_chat):
@@ -167,9 +190,10 @@ async def test_L07_L08_L10_load_only_requested_skill_and_cannot_grant_authority(
 async def test_L11_only_retrieved_chunk_ids_and_versions(env,loop_chat):
     env['rag'].build('knowledge')
     bad_id='a'*24
-    result,_,_,_=await loop_chat('保修政策',[[call('search_knowledge',{'query':'耳机保修'})],f'错误引用 [{bad_id}]'])
+    result,_,trace,_=await loop_chat('保修政策',[[call('search_knowledge',{'query':'耳机保修'})],f'错误引用 [{bad_id}]'])
     assert result['citations'] and bad_id not in result['answer']
-    assert all('['+row['chunk_id']+']' in result['answer'] and row['version'] for row in result['citations'])
+    assert result['answer']=='暂未得到可核实的答复，请稍后重试。'
+    assert any(e['type']=='loop.reply_composed' and e['validation']=='UNVERIFIED_CITATION' for e in trace['events'])
 
 
 async def test_L12_foreign_order_not_exposed(loop_chat):
@@ -226,17 +250,16 @@ async def test_agent_refund_decision_starts_preview_only(env,loop_chat,text,orde
 
 async def test_agent_composes_refund_eligibility_with_each_verified_order(env,loop_chat):
     def compose(body):
-        facts = json.loads(body['messages'][1]['content'])['current_task']['reply_facts']
-        assert 'O1001 可申请退款' in facts['B1']['preview']
-        assert 'O1004 暂不能自动退款（EXPIRED）' in facts['B2']['preview']
-        return '为您整理如下：{{B2}}；另外，{{B1}}。'
+        observations = [json.loads(row['content'])['data'] for row in body['messages'] if row['role']=='tool']
+        assert [row['reason_code'] for row in observations]==['ELIGIBLE','EXPIRED']
+        return 'O1001 可申请退款。O1004 暂不能自动退款（EXPIRED）。本次仅查询资格。'
 
     decisions = [[call('check_refund_eligibility',{'order_id':'O1001'},'eligible'),
                   call('check_refund_eligibility',{'order_id':'O1004'},'expired')], compose]
     result,_,trace,_=await loop_chat('对比 O1001 和 O1004 的退款资格，先别申请。',decisions)
     assert 'O1004 暂不能自动退款（EXPIRED）' in result['answer']
     assert 'O1001 可申请退款' in result['answer']
-    assert next(event['mode'] for event in trace['events'] if event['type']=='loop.reply_composed')=='MODEL_TEMPLATE'
+    assert next(event['mode'] for event in trace['events'] if event['type']=='loop.reply_composed')=='MODEL_DIRECT'
     assert count(env,workflow_instances)==count(env,refund_requests)==0
 
 
@@ -251,9 +274,20 @@ async def test_agent_cannot_turn_unknown_refund_into_success_while_answering_shi
     ]
     result,_,_,_=await loop_chat('退款 O1001，另外查 O1002 的物流。',decisions)
     assert result['refund_workflow_result']['status']=='UNKNOWN'
-    assert '暂未确认' in result['answer'] and '运输中' in result['answer']
+    assert '暂未确认' in result['answer'] and '物流已到' not in result['answer']
     assert '已受理' not in result['answer'] and 'forged-id' not in result['answer']
     assert count(env,refund_requests)==0
+
+
+async def test_direct_refund_status_can_use_verified_receipt(env, loop_chat):
+    preview = await env['agent'].chat(env['a'], env['conv'], '退订单 O1001', 'deterministic')
+    pending = preview['pending_confirmation']
+    receipt = await env['agent'].confirm(env['a'], pending['workflow_id'], pending['confirm_nonce'])
+    draft = f"O1001 的退款申请已受理（编号 {receipt['refund_request_id']}），受理不代表退款已到账。"
+    result, _, _, _ = await loop_chat('查 O1001 的退款进度', [
+        [call('get_order', {'order_id':'O1001'})], draft,
+    ])
+    assert result['answer'] == draft and count(env, refund_requests) == 1
 
 
 async def test_agent_product_tool_exposes_and_applies_generic_filters(env,loop_chat):
@@ -346,7 +380,9 @@ async def test_L22_L23_memory_cross_session_without_per_turn_extraction(env,loop
     from app.db import memory_jobs, memory_pending
     assert count(env,memory_jobs)==count(env,memory_pending)==0
     result,_,trace,_=await loop_chat('查订单 O1001',[[call('get_order',{'order_id':'O1001'})],'查到订单。'],conversation=second)
-    assert '降噪' not in result['answer'] and not any(row['type']=='memory.context_injected' for row in trace['events'])
+    assert '降噪' not in result['answer']
+    assert [action['name'] for action in result['tool_actions']] == ['get_order']
+    assert any(row['type']=='memory.context_injected' and row['injected_count']==1 for row in trace['events'])
 
 
 async def test_L25_shared_evaluator_reports_skill_control_and_loop_metrics(env):

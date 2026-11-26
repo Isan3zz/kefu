@@ -112,8 +112,10 @@ async def run_case(case, variant, config, mode, embedding, run_id):
         with db.tx() as connection:
             connection.execute(users.insert().values(id='memory_same_tenant', tenant_id='a', role='customer'))
         history_id = business.conversation(owner)['id']
-        gateway = Gateway(business, cfg, create_mcp(business, cfg.mcp_service_secret, testing=True))
         rag = RAG(db, FakeModels() if embedding == 'fake' else None, cfg)
+        from app.retrieval_mcp import RetrievalService, create_retrieval_mcp
+        retrieval = create_retrieval_mcp(RetrievalService(business, cfg, rag=rag), cfg)
+        gateway = Gateway(business, cfg, create_mcp(business, cfg.business_secret, testing=True), retrieval_server=retrieval)
         agent = Agent(business, gateway, cfg, rag)
         model_mode = 'deterministic' if mode == 'deterministic' else 'agent-real'
         fixtures = {turn.text: [dict(type=fact.type, subject_key=fact.key, content=fact.content, evidence_excerpt=fact.content)
@@ -275,6 +277,7 @@ def summarize(cases):
 
 async def run_memory(dataset, variants=('trigger-batch',), mode='deterministic', embedding='fake', config=settings,
                      output_root=Path('data/eval_runs'), case_id=None):
+    config = config.model_copy(update={'memory_context_mode': 'semantic'})
     raw, cases = load_memory_dataset(Path(dataset))
     if case_id:
         cases = [case for case in cases if case.case_id == case_id]
@@ -297,7 +300,7 @@ async def run_memory(dataset, variants=('trigger-batch',), mode='deterministic',
             failures['MEMORY_TRIGGER_FALSE_NEGATIVE'] = len(detail['false_negatives'])
         result = {'run_id': run_id + '-' + variant, 'dataset_sha256': hashlib.sha256(raw).hexdigest(),
                   'variant': variant, 'fixture': {'version': FIXTURE_VERSION, 'clock': FIXTURE_TIME},
-                  'release': {**snapshot, 'memory_pipeline_version': PIPELINE_VERSION,
+                  'release': {**snapshot, 'evaluator': 'memory-v1', 'memory_pipeline_version': PIPELINE_VERSION,
                               'trigger_rule_version': TRIGGER_VERSION, 'batch_policy_version': BATCH_POLICY_VERSION,
                               'extractor_version': EXTRACTOR_VERSION,
                               'extraction_model': 'FixtureMemoryGateway' if mode == 'deterministic' else config.memory_extraction_model or config.llm_model,

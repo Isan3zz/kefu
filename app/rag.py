@@ -13,6 +13,7 @@ import numpy as np
 from sqlalchemy import select
 from app.config import settings
 from app.db import documents, document_chunks, knowledge_snapshots, uid, now
+from app.observability import emit
 
 CHUNKER_VERSION='paragraph-v2-400-60'
 MODEL_LOAD_LOCK = Lock()
@@ -147,7 +148,11 @@ class RAG:
         if not rows: raise ValueError('Empty knowledge corpus')
         vectors=np.asarray(self.model().encode([r['content'] for r in rows]))
         if vectors.shape!=(len(rows),1024): raise ValueError('Expected 1024 dimensional embeddings')
-        snapshot='kb-'+uid(); collection=self.client().create_collection(snapshot,embedding_function=None,configuration={'hnsw':{'space':'cosine'}})
+        snapshot='kb-'+uid()
+        collection=self.client().create_collection(
+            snapshot, embedding_function=None,
+            configuration={'hnsw':{'space':'cosine','sync_threshold':1}},
+        )
         collection.add(ids=[r['chunk_id'] for r in rows],embeddings=vectors.tolist(),metadatas=[{'tenant_id':json.loads(r['metadata_json'])['tenant_id'],'document_id':r['document_id']} for r in rows])
         # Both stores are immutable per snapshot. The pointer changes only after full success.
         artifact=Path(self.config.bm25_index_path)/(snapshot+'.json')
@@ -180,7 +185,11 @@ class RAG:
         rows=[r for r in rows if r['document_id'] in docs and visible(docs[r['document_id']],tenant) and json.loads(r['metadata_json'])['version']==docs[r['document_id']]['version']]
         if document_ids is not None:
             rows = [row for row in rows if row['document_id'] in document_ids]
-        if not rows: return []
+        revisions={key+'_revision':value.get('revision') if isinstance(value,dict) else value for key,value in manifest['models'].items() if key in ('embedding','reranker')}
+        provenance = dict(knowledge_snapshot=manifest['snapshot'], model_revision=revisions)
+        if not rows:
+            emit('retrieval.stages', **provenance, candidate_count=0, stages={})
+            return []
         by_id={r['chunk_id']:r for r in rows}; rankings=[]; stages={}
         if mode!='bm25':
             t=time.perf_counter(); v=np.asarray(self.model().encode([query]))
@@ -193,17 +202,29 @@ class RAG:
             t=time.perf_counter(); bm=BM25Okapi([tokenize(r['content']) for r in rows]); scores=bm.get_scores(tokenize(query))
             order=sorted(range(len(rows)),key=lambda j:(-scores[j],rows[j]['chunk_id']))[:self.config.retrieval_bm25_k]
             rankings.append([rows[j]['chunk_id'] for j in order]); stages['bm25_ms']=(time.perf_counter()-t)*1000
+        t=time.perf_counter()
         fusion={}
         for rank in rankings:
             for idx,cid in enumerate(rank,1): fusion[cid]=fusion.get(cid,0)+1/(self.config.retrieval_rrf_k+idx)
         chosen=sorted(fusion,key=lambda cid:(-fusion[cid],cid))
+        stages['rrf_ms']=(time.perf_counter()-t)*1000
         rerank={}
         if mode=='hybrid_rerank':
             t=time.perf_counter(); chosen=chosen[:self.config.retrieval_rerank_k]
             scores=self.model().score([(query,by_id[cid]['content']) for cid in chosen])
             rerank=dict(zip(chosen,map(float,scores))); chosen.sort(key=lambda cid:(-rerank[cid],cid)); stages['rerank_ms']=(time.perf_counter()-t)*1000
-        revisions={key+'_revision':value.get('revision') if isinstance(value,dict) else value for key,value in manifest['models'].items() if key in ('embedding','reranker')}
-        return [dict(chunk_id=cid,doc_id=by_id[cid]['document_id'],content=by_id[cid]['content'],document_title=docs[by_id[cid]['document_id']]['title'],version=docs[by_id[cid]['document_id']]['version'],source=docs[by_id[cid]['document_id']]['source_path'],retrieval_rank=idx,rrf_score=fusion[cid],rerank_score=rerank.get(cid),snapshot=manifest['snapshot'],stages=stages,latency_ms=(time.perf_counter()-started)*1000,**revisions) for idx,cid in enumerate(chosen[:k or self.config.retrieval_context_k],1)]
+        with self.db.tx() as c:
+            # Hydrate hits from the authoritative store after vector retrieval and reranking.
+            live = {row['chunk_id']: row for row in c.execute(
+                select(document_chunks.c.chunk_id, document_chunks.c.content, document_chunks.c.content_hash, documents)
+                .join(documents, documents.c.id == document_chunks.c.document_id)
+                .where(document_chunks.c.chunk_id.in_(chosen))
+            ).mappings()
+                    if visible(row, tenant) and row['content_hash'] == by_id[row['chunk_id']]['content_hash']
+                    and row['version'] == json.loads(by_id[row['chunk_id']]['metadata_json'])['version']}
+        emit('retrieval.stages', **provenance, candidate_count=len(fusion), stages=stages)
+        authorized = [cid for cid in chosen if cid in live][:k or self.config.retrieval_context_k]
+        return [dict(chunk_id=cid,doc_id=live[cid]['id'],content=live[cid]['content'],document_title=live[cid]['title'],version=live[cid]['version'],source=live[cid]['source_path'],retrieval_rank=idx,rrf_score=fusion[cid],rerank_score=rerank.get(cid),snapshot=manifest['snapshot'],stages=stages,latency_ms=(time.perf_counter()-started)*1000,**revisions) for idx,cid in enumerate(authorized,1)]
 
 def model_manifest():
     path=Path('models/model_manifest.json')
