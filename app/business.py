@@ -254,6 +254,22 @@ class Business:
         row=c.execute(select(tickets.c.status).where(tickets.c.id==tid,tickets.c.tenant_id==a.tenant_id,
             tickets.c.user_id==a.user_id,tickets.c.conversation_id==conv)).first()
         return dict(ticket_id=tid,status=row.status) if row else None
+    @staticmethod
+    def shipment_summary(connection, order_id):
+        query = select(shipments.c.order_id, shipments.c.status, shipments.c.carrier, shipments.c.tracking_no).where(
+            shipments.c.order_id == order_id
+        ).order_by(shipments.c.updated_at.desc(), shipments.c.id)
+        summary = []
+        seen = set()
+        for row in connection.execute(query).mappings():
+            if row['tracking_no']:
+                parcel = (row['carrier'], row['tracking_no'])
+                if parcel in seen:
+                    continue
+                seen.add(parcel)
+            summary.append({key: row[key] for key in ('order_id', 'status', 'carrier')})
+        return summary
+
     def tool(self,a,name,args):
         if name=='begin_refund_workflow':
             if not a.refund_preview_scope:
@@ -270,7 +286,12 @@ class Business:
                 return [dict(r) for r in c.execute(select(orders).where(orders.c.tenant_id==a.tenant_id,orders.c.user_id==a.user_id).order_by(orders.c.paid_at.desc(),orders.c.id).limit(max(1,min(int(args.get('limit',10)),20)))).mappings()]
             if name=="get_order":
                 o=self.owned(c,orders,a,args['order_id'])
-                o['items']=[dict(r) for r in c.execute(select(order_items).where(order_items.c.order_id==o['id'])).mappings()]
+                item_query = select(order_items, products.c.name.label('product_name')).select_from(
+                    order_items.outerjoin(products, (products.c.id == order_items.c.product_id)
+                                          & (products.c.tenant_id == a.tenant_id))
+                ).where(order_items.c.order_id == o['id']).order_by(order_items.c.id)
+                o['items'] = [dict(row) for row in c.execute(item_query).mappings()]
+                o['shipments'] = self.shipment_summary(c, o['id'])
                 refund=c.execute(select(refund_requests.c.id.label('refund_request_id'),refund_requests.c.status,refund_requests.c.amount_cents,refund_requests.c.created_at).where(refund_requests.c.order_id==o['id'],refund_requests.c.tenant_id==a.tenant_id,refund_requests.c.user_id==a.user_id)).mappings().first()
                 o['refund_request']=dict(refund) if refund else None
                 return o

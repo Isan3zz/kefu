@@ -69,6 +69,7 @@ class ToolExecutionResult(BaseModel):
     data:dict|list|str|None=None
     error:dict|None=None
     request_id:str
+    operation_id:str|None=None
     attempts:int=Field(ge=0)
     latency_ms:float=Field(ge=0)
     outcome:Literal['SUCCESS','KNOWN_FAILURE','UNKNOWN_OUTCOME']

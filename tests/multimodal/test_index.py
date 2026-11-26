@@ -16,7 +16,7 @@ ADMIN = Actor('admin', 'a', 'admin')
 def test_MM01_missing_model_is_explicit(mm):
     example = Settings(_env_file=ROOT/'.env.example')
     assert example.chinese_clip_local_only and not example.multimodal_index_on_upload
-    encoder = mm['agent'].multimodal_index.encoder
+    encoder = mm['index'].encoder
     with pytest.raises(DomainError, match='download_chinese_clip.py') as error:
         encoder.encode_texts(['红色'])
     assert isinstance(encoder, ChineseCLIPEncoder)
@@ -41,7 +41,9 @@ def test_MM12_collection_spaces_are_separate(indexed):
     bge = client.create_collection('test_bge_space', embedding_function=None)
     bge.add(ids=['bge'], embeddings=[[1.0] * 1024])
     for kind, ident in ((IMAGES, row['image_id']), (TEXTS, text_id)):
-        item = index.collection(kind).get(ids=[ident], include=['embeddings', 'metadatas'])
+        collection = index.collection(kind)
+        assert collection.configuration['hnsw']['sync_threshold'] == 1
+        item = collection.get(ids=[ident], include=['embeddings', 'metadatas'])
         assert item['embeddings'].shape == (1, 512)
         assert item['metadatas'][0]['model_revision'] == index.encoder.revision
     assert bge.get(include=['embeddings'])['embeddings'].shape == (1, 1024)

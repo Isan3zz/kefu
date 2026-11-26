@@ -13,8 +13,8 @@ class Principal:
 class ExecutionContext:
     invocation_id:str
     trace_id:str
-    conversation_id:str
-    graph_thread_id:str
+    conversation_id:str|None
+    graph_thread_id:str|None
     principal:Principal
     agent_release_id:str
     deadline_monotonic:float

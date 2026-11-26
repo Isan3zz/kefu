@@ -1,0 +1,92 @@
+{
+  "version": "1.0.0",
+  "split": "development",
+  "source": "Historical fixtures, regressions and experiments already exposed to development.",
+  "datasets": [
+    {
+      "path": "agent_loop.jsonl",
+      "sha256": "fc914b769e4ca348ae07580c754a44a269063b0af1b7806dd77b4fe518280c0f",
+      "count": 5
+    },
+    {
+      "path": "compound_tasks.jsonl",
+      "sha256": "b4418a1e4dc787e375e0146f6c9cb61da83c4a542fba78cb2d3a76f94209143d",
+      "count": 12
+    },
+    {
+      "path": "harness_context.jsonl",
+      "sha256": "3b3e330fd61ad1875e337ef20402c38dfb07e3ba1ef5582ace954a794372d7b5",
+      "count": 2
+    },
+    {
+      "path": "intent.jsonl",
+      "sha256": "2a43e5d9be80d35ec6adf583040c1e8bd5f70a1b3b00d3e8c1df88367301d6c7",
+      "count": 12
+    },
+    {
+      "path": "kefu_e2e_100.jsonl",
+      "sha256": "8815a8b73f73700bef0f1dbb80f5d4e4a5982a2659564c7aeef874f99c6066f7",
+      "count": 100
+    },
+    {
+      "path": "kefu_e2e_10_smoke.jsonl",
+      "sha256": "cfc825f840842ca1e60d40a63a1fc7d2d70f8eb95c20301cb0f9cbd6fa8b1b98",
+      "count": 10
+    },
+    {
+      "path": "memory.jsonl",
+      "sha256": "7aa4beb050c75bae64c51268d9066766ecbb726330b12ea759e3f26a767d64dd",
+      "count": 23
+    },
+    {
+      "path": "rag_v3_gold_60_extended.jsonl",
+      "sha256": "4246b9b4880b36c78033e63aa3b8ad98e6081c9a4ac759a2e8b123b0cccaa4ea",
+      "count": 60
+    },
+    {
+      "path": "rag_v3_positive_01_tenant_b_adapter_required.jsonl",
+      "sha256": "143bcff181226bcf5e01e49f38e72d8e6e4f9c52f23150e31cc2c5285fbbcdd3",
+      "count": 1
+    },
+    {
+      "path": "rag_v3_positive_01_tenant_b_scoped.jsonl",
+      "sha256": "edce74640216fd82cdbb0f4b974a0da3761682973181370b68b36d8b503315f7",
+      "count": 1
+    },
+    {
+      "path": "rag_v3_positive_51_tenant_a_ready.jsonl",
+      "sha256": "9a43186808cd0a1bd60162989ef88328d43d952192c6bace28c81f8244e01a51",
+      "count": 51
+    },
+    {
+      "path": "rag_v3_positive_52_compatible.jsonl",
+      "sha256": "715e98501a398a2197374b0fda04bdcc2f5a3e0eab71a77391be003b7fa8c6cf",
+      "count": 52
+    },
+    {
+      "path": "rag_v3_positive_52_tenant_scoped.jsonl",
+      "sha256": "f1f52e0460e3802f226701d8974f46c46bdb7c14eccd6b6e7e73591e77b05d72",
+      "count": 52
+    },
+    {
+      "path": "retrieval.jsonl",
+      "sha256": "c6fb629000523435c8440d371ad5488ab7b8ead364c59a380abbe3bfb5bc13e4",
+      "count": 10
+    },
+    {
+      "path": "safety.jsonl",
+      "sha256": "fda8ed4f9ed19f85e0cd79204d94fa0c73e600cf72c9d4d5a9aaf4a8b4cec711",
+      "count": 4
+    },
+    {
+      "path": "skill.jsonl",
+      "sha256": "f3fadc55bba75072bf02423ee657cfbb68105fd66ccc72dd20fd51abe9dbf0e3",
+      "count": 12
+    },
+    {
+      "path": "workflow.jsonl",
+      "sha256": "75f67c5ef7366a056ab8735fdd5565e2c000929996fc4d74be6863805680e9d8",
+      "count": 10
+    }
+  ]
+}

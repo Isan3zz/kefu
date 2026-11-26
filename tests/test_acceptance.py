@@ -8,7 +8,7 @@ from sqlalchemy import select,func
 from app.business import DomainError,Actor
 from app.db import *
 from app.agent import Agent
-from app.mcp import create_mcp,sign_actor,test_credential,verify_actor
+from app.mcp import create_mcp,sign_actor,verify_actor
 from app.rag import RAG,LocalModels,require_model
 from app.skills import SkillManager
 from app.evaluation import assertions,run,compare,judge

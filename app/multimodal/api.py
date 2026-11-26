@@ -1,6 +1,7 @@
 """Authenticated image endpoints on the existing FastAPI application."""
 import asyncio
 from contextlib import contextmanager
+import time
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import Response
@@ -9,6 +10,8 @@ from starlette.formparsers import MultiPartException
 
 from app.business import DomainError
 from app.db import uid
+from app.harness.execution_context import ExecutionContext, RunBudget
+from app.harness.telemetry import Telemetry
 from app.observability import TraceRecorder, active_trace
 from app.multimodal.retrieval import ByImage, ByImageAndText, ByText
 
@@ -39,7 +42,7 @@ def image_trace(repo, principal, response, conversation_id=None):
         response.headers['X-Trace-ID'] = recorder.trace_id
 
 
-def image_router(repo, index, actor, envelope):
+def image_router(repo, actor, envelope):
     class UploadRoute(APIRoute):
         def get_route_handler(self):
             handler = super().get_route_handler()
@@ -107,40 +110,49 @@ def image_router(repo, index, actor, envelope):
     def delete(image_id: str, response: Response, principal=Depends(actor)):
         with image_trace(repo, principal, response):
             result = repo.delete(image_id, principal)
-            # A failed projection remains queued. SQLite revokes access first.
-            if principal.role == 'admin':
-                try:
-                    index.sync('product_image', target_id=image_id)
-                except Exception as error:
-                    recorder = active_trace.get()
-                    recorder.emit('multimodal.index.cleanup_deferred', error_type=type(error).__name__)
         return envelope(result)
 
     return router
 
 
-def retrieval_router(service, actor, envelope):
+def retrieval_router(repo, executor, actor, envelope):
     router = APIRouter(prefix='/api/v1/multimodal/search', tags=['multimodal'])
 
-    def search(name, body, principal, response):
-        with image_trace(service.repo, principal, response):
-            items = service.search(name, principal, **body.model_dump())
-        return envelope({'items': items, 'count': len(items)})
+    async def search(name, body, principal, response):
+        with image_trace(repo, principal, response):
+            recorder = active_trace.get()
+            ctx = ExecutionContext(
+                invocation_id=recorder.payload['invocation_id'], trace_id=recorder.trace_id,
+                principal=principal, conversation_id=None, graph_thread_id=None,
+                agent_release_id=repo.config.agent_release_id,
+                deadline_monotonic=time.monotonic()+repo.config.agent_timeout_seconds,
+            )
+            try:
+                async with asyncio.timeout(ctx.remaining()):
+                    result = await executor.invoke_image_search(
+                        ctx=ctx, tool_name=name, arguments=body.model_dump(), budget=RunBudget(),
+                        telemetry=Telemetry(ctx, repo.config.harness_trace_enabled),
+                    )
+            except TimeoutError:
+                raise DomainError('TOOL_TIMEOUT', '商品图文检索超时') from None
+            if not result.ok:
+                raise DomainError(result.error['code'], result.error['message'])
+        return envelope({'items': result.data, 'count': len(result.data)})
 
     @router.post('/by-image')
-    def by_image(body: ByImage, response: Response, principal=Depends(actor)):
-        return search('search_products_by_image', body, principal, response)
+    async def by_image(body: ByImage, response: Response, principal=Depends(actor)):
+        return await search('search_products_by_image', body, principal, response)
 
     @router.post('/by-text')
-    def by_text(body: ByText, response: Response, principal=Depends(actor)):
-        return search('search_images_by_text', body, principal, response)
+    async def by_text(body: ByText, response: Response, principal=Depends(actor)):
+        return await search('search_images_by_text', body, principal, response)
 
     @router.post('/by-image-and-text')
-    def by_image_and_text(body: ByImageAndText, response: Response, principal=Depends(actor)):
-        return search('search_products_by_image_and_text', body, principal, response)
+    async def by_image_and_text(body: ByImageAndText, response: Response, principal=Depends(actor)):
+        return await search('search_products_by_image_and_text', body, principal, response)
 
     @router.post('/text-by-image')
-    def text_by_image(body: ByImage, response: Response, principal=Depends(actor)):
-        return search('search_text_by_image', body, principal, response)
+    async def text_by_image(body: ByImage, response: Response, principal=Depends(actor)):
+        return await search('search_text_by_image', body, principal, response)
 
     return router

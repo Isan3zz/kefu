@@ -8,6 +8,8 @@ from PIL import Image, ImageDraw
 import pytest
 
 from app.main import create_app
+from app.mcp import Gateway, create_mcp
+from app.retrieval_mcp import RetrievalService, create_retrieval_mcp
 
 
 def picture(fmt='PNG', color='red', size=(80, 60)):
@@ -23,11 +25,14 @@ def mm(env, tmp_path):
     cfg = env['cfg'].model_copy(update={'multimodal_image_path': str(tmp_path/'images'),
                                       'chinese_clip_model_path': str(tmp_path/'missing-clip'),
                                       'multimodal_enabled': True})
-    app = create_app(cfg, env['db'], env['gateway'], env['rag'])
+    retrieval = RetrievalService(env['b'], cfg, rag=env['rag'])
+    gateway = Gateway(env['b'], cfg, create_mcp(env['b'], cfg.business_secret, testing=True),
+                      retrieval_server=create_retrieval_mcp(retrieval, cfg))
+    app = create_app(cfg, env['db'], gateway, env['rag'])
     with TestClient(app) as client:
         tokens = {user: client.post('/api/v1/auth/demo-login', json={'demo_user_key': user}).json()['data']['token']
                   for user in ('user_a', 'user_b', 'admin')}
-        yield dict(env, cfg=cfg, app=app, agent=app.state.agent, client=client, tokens=tokens)
+        yield dict(env, cfg=cfg, app=app, agent=app.state.agent, client=client, tokens=tokens, index=retrieval.index)
 
 
 def auth(mm, user='user_a'):
@@ -57,7 +62,7 @@ class FakeMultimodalEncoder:
 
 @pytest.fixture
 def indexed(mm):
-    index = mm['agent'].multimodal_index
+    index = mm['index']
     index.encoder = FakeMultimodalEncoder()
     admin = Actor('admin', 'a', 'admin')
     row = index.repo.save(picture(), 'shape.png', admin, product_id='headphones-a')

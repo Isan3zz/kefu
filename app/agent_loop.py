@@ -15,21 +15,23 @@ from app.agent import State, ORDER_IDS, ORDER_ORDINAL, fake_next_action, resolve
 from app.business import DomainError
 from app.db import digest, uid
 from app.harness.contracts import HarnessFailure
-from app.harness.policy_guard import INTERNAL_SCHEMAS
+from app.harness.tool_executor import knowledge_observation
 from app.harness.tool_protocol import ordered_calls, protocol_messages
 from app.loop_tools import TOOL_SKILLS, VISIBLE_SCHEMAS, tool_catalog
+from app.mcp import RETRIEVAL_TOOLS, RETRIEVAL_UNAVAILABLE_ERRORS
 from app.memory.recommendations import budget_for, ceiling as explicit_price_ceiling
 from app.memory.trigger import CHANGE, STABLE, recommendation_request
 from app.multimodal.retrieval import TOOL_ARGS
 from app.multimodal.tool_adapter import tool_schemas
 from app.observability import active_trace, clean
 from app.refund_workflow import RefundWorkflowResult
-from app.reply_composer import FACT_MARKER, REPLY_INSTRUCTION, ReplyFact, render_checked
 
-PROMPT_VERSION = 'agent-loop-v6'
+PROMPT_VERSION = 'agent-loop-v9'
 SYSTEM = ('你是中文客服。自主选择工具，收到可信结果后答复；无须工具时直接答复。'
           '同一条消息有多个需求时查齐再答，可一批提议多个只读调用。不要重复已得到结果的工具。'
-          '围绕用户当前的问题给出结论，逐项回答他问到的内容；无法核实的部分单独说明。'
+          '查完后直接用自然中文回答用户，先给当前订单或商品的结论，再逐项说明用户问到的内容。'
+          '用户问到的字段为空时说明暂无记录；用户问如何核实时，简短给出有依据的下一步。'
+          '把知识证据转述成简短的客户说明，只覆盖当前问题。省略内部字段、处理指令、系统实现和演示环境说明。'
           '根据用户表达的目标区分退款政策、资格检查、申请和进度。'
           '用户明确要求发起退款时，核实订单后用 begin_refund_workflow 生成待确认预览。'
           '资格或金额咨询只用 check_refund_eligibility，进度用 get_order，政策用 search_knowledge。'
@@ -60,9 +62,12 @@ BUSINESS_TOOLS = set(TOOL_SKILLS) - {'search_knowledge'}
 CLAIM = re.compile(r'(?:退款|订单|工单|物流|库存|价格).{0,16}(?:已|成功|受理|到账|运输中|元|有货)|退款.{0,6}(?:完成|到账)|已.{0,8}(?:退款|发货|签收|转接|创建工单)|\bO[0-9]+\b.*(?:元|状态)|\d+(?:\.\d+)?\s*(?:元|件)', re.I)
 CITATION = re.compile(r'\[([a-f0-9]{24})\]')
 VERSIONED_CITATION = re.compile(r'\[([a-f0-9]{24})\]\s*(?:v|版本\s*)([0-9][\w.-]*)')
-OUT_OF_SCOPE_STATUS = re.compile(
-    r'(?:^|[。！？\n])\s*(?:(?:您的|本次)?(?:退款(?:申请)?已(?:到账|提交|受理)|工单已创建)|已为您(?:创建工单|提交退款))'
+LEGACY_FACT_MARKER = re.compile(r'\{\{[BK][1-9][0-9]*\}\}')
+WRITE_STATUS = re.compile(
+    r'退款(?:申请)?(?:已经|已)(?:到账|提交|受理|成功|完成)|退款成功|'
+    r'(?:已经|已)(?:为您|为你)?(?:创建(?:人工)?工单|提交退款)|(?:人工)?工单(?:已经|已)创建'
 )
+CLAIM_QUALIFIER = re.compile(r'(?:不代表|尚不意味着|不得称为|不能确认|无法确认|无法证明|如果|若|是否)\s*[「“”]?\s*$')
 
 
 class LoopState(State, total=False):
@@ -118,7 +123,9 @@ class AgentLoop:
                 self.visual_tools.add('search_images_by_text')
         self.catalog.extend(tool_schemas(sorted(self.visual_tools)))
         self.emit('started')
-        if self.config.memory_enabled and self.recommendation and self.ceiling is None and not (STABLE.search(self.text) or CHANGE.search(self.text)):
+        if self.config.memory_context_mode == 'profile':
+            self.memories = await asyncio.to_thread(self.agent.memory.load_profile, self.ctx.principal)
+        elif self.config.memory_enabled and self.recommendation and self.ceiling is None and not (STABLE.search(self.text) or CHANGE.search(self.text)):
             self.memories = await self.agent.memory.search(principal=self.ctx.principal, query=self.text)
         return {'loop_messages':[RemoveMessage(id=REMOVE_ALL_MESSAGES)], 'terminal_reason':None,
                 'loop_invocation_id':self.ctx.invocation_id, 'loop_observations':[], 'loop_seen':[],
@@ -142,7 +149,6 @@ class AgentLoop:
         meta = [{key: entry[key] for key in ('name','description')} for entry in self.agent.skills.catalog.values() if entry['enabled']]
         previous = state['loop_messages']
         direct_product_reply = self.uses_direct_product_reply(state)
-        facts = {} if direct_product_reply else self.reply_facts(state)
         progress = {'iteration_count':self.budget.steps}
         task = {'message':self.text,'active_workflow_id':state.get('active_workflow_id'),
                 'resolved_order_id':self.resolve(state),'available_skills':meta if self.skill_mode != 'none' else []}
@@ -169,18 +175,14 @@ class AgentLoop:
                 candidates = self.recommendation_candidates(rows, memories, budget_for(self.text, memories))
                 task['preferred_product_ids'] = [row['id'] for row in candidates]
             reply_instruction = PRODUCT_REPLY_INSTRUCTION
-        elif facts:
-            task['reply_facts'] = {key:{'label':fact.label,'preview':fact.text[:240],
-                                        'selection_group':fact.selection_group}
-                                   for key,fact in facts.items()}
-            reply_instruction = REPLY_INSTRUCTION
         started = time.perf_counter()
         try:
             context = await self.services.context.build_context(
                 ctx=self.ctx, task_state=task, recent_messages=state['messages'],
                 system_prompt=SYSTEM + visual_instruction + reply_instruction, telemetry=self.telemetry,
                 memories=memories,
-                memory_embedding_version=self.agent.memory.index.version if self.memories else None,
+                full_profile=self.config.memory_context_mode == 'profile',
+                memory_embedding_version=self.agent.memory.index.version if self.memories and self.config.memory_context_mode == 'semantic' else None,
                 evidence=state['retrieved_chunks'] if direct_product_reply else None,
                 protocol=protocol_messages(previous),
             )
@@ -239,17 +241,7 @@ class AgentLoop:
         if name and name not in names:
             wire = SimpleNamespace(type='function', id=uid('call-'), function=SimpleNamespace(name=name, arguments=json.dumps(args,ensure_ascii=False)))
             return SimpleNamespace(tool_calls=[wire], content='')
-        facts = self.reply_facts(state)
-        if facts:
-            required = [key for key, fact in facts.items() if key.startswith('B') and fact.required]
-            candidate = next((key for key, fact in facts.items()
-                              if fact.selection_group == 'product_candidate'), None)
-            keys = required + ([candidate] if candidate else []) + [key for key in facts if key.startswith('K')][:1]
-            draft = ('为您整理如下：' if len(keys)>1 else '') + '；'.join('{{' + key + '}}' for key in keys) + '。'
-            return SimpleNamespace(tool_calls=[], content=draft)
-        if state['retrieved_chunks']:
-            return SimpleNamespace(tool_calls=[], content=self.display_knowledge(state['retrieved_chunks']))
-        return SimpleNamespace(tool_calls=[], content='您好，可以咨询商品、查询订单物流、申请退款或转人工。')
+        return SimpleNamespace(tool_calls=[], content=self.offline_answer(state))
 
     def select_skill(self, name, progress):
         if not name or name == progress['selected_skill']:
@@ -259,59 +251,54 @@ class AgentLoop:
         recorder.emit('skill_select', result=name, reason='tool_capability')
         self.telemetry.emit('skill.selected', name=name, source='tool_capability')
 
-    async def internal(self, name, args, state, progress):
-        if name == 'load_skill':
-            entry = self.agent.skills.catalog.get(args['name'])
-            if not entry or not entry['enabled'] or self.skill_mode == 'none':
-                raise DomainError('POLICY_DENIED','该技能未启用或不在白名单')
-            try:
-                skill = self.agent.skills.load(args['name'])
-            except ValueError:
-                raise DomainError('POLICY_DENIED','技能文件路径或元数据无效') from None
-            if len(skill['instructions'].encode()) > 8000:
-                raise DomainError('INVALID_ARGUMENT','技能内容超出预算')
-            attrs = {key:skill[key] for key in ('name','version','hash','estimated_tokens','duration_ms')}
-            self.select_skill(args['name'], progress)
-            active_trace.get().emit('skill_load', **attrs)
-            self.telemetry.emit('skill.loaded', **attrs)
-            self.emit('skill_activated', **attrs)
-            return {**attrs, 'guidance':skill['instructions']}
-        if name in TOOL_ARGS:
-            return await self.agent.multimodal.run(name, self.ctx.principal, self.ctx.conversation_id,
-                                                   required_max_price=self.visual_ceiling, **args)
-        if name == 'search_knowledge':
-            query = args['query']
-            scope = {}
-            if args.get('product_id'):
-                product_id = args['product_id']
-                matches = [hit for event in progress['loop_observations']
-                           if event['name'] in TOOL_ARGS and event['result']['ok']
-                           for hit in event['result']['data'] if hit.get('product_id') == product_id]
-                if not matches:
-                    raise DomainError('INVALID_ARGUMENT', '请先查询该商品的图文候选')
-                name_from_catalog, doc_ids = await asyncio.to_thread(
-                    self.agent.multimodal.knowledge_scope, self.ctx.principal, product_id)
-                if doc_ids:
-                    scope['document_ids'] = doc_ids
-                query = name_from_catalog + '：' + query
-            product = state.get('active_product_name')
-            if product and any(word in query for word in ('它','这个','这款','刚才')) and product not in query:
-                query = product+'：'+query
-                active_trace.get().emit('query_rewrite',reason='bound_product_reference',product_name=product)
-            started = time.perf_counter()
-            try:
-                chunks = await asyncio.to_thread(self.agent.rag.search, query, self.ctx.principal.tenant_id, **scope)
-            except FileNotFoundError:
-                raise DomainError('KNOWLEDGE_NOT_READY','知识索引暂不可用') from None
-            evidence = {chunk['chunk_id']:chunk for chunk in progress['retrieved_chunks']}
-            evidence.update((chunk['chunk_id'], chunk) for chunk in clean(chunks))
-            progress['retrieved_chunks'] = list(evidence.values())
-            active_trace.get().emit('retrieval', chunks=chunks, duration_ms=(time.perf_counter()-started)*1000)
-            for event in ('rag.retrieved', 'rag.reranked'):
-                self.telemetry.emit(event, chunk_ids=[chunk['chunk_id'] for chunk in chunks], count=len(chunks),
-                                    snapshot=chunks[0]['snapshot'] if chunks else None)
-            return [{key:chunk[key] for key in ('chunk_id','doc_id','document_title','version') if key in chunk}
-                    | {'snippet':chunk['content'][:400]} for chunk in chunks]
+    async def load_skill(self, args, progress):
+        entry = self.agent.skills.catalog.get(args['name'])
+        if not entry or not entry['enabled'] or self.skill_mode == 'none':
+            raise DomainError('POLICY_DENIED','该技能未启用或不在白名单')
+        try:
+            skill = self.agent.skills.load(args['name'])
+        except ValueError:
+            raise DomainError('POLICY_DENIED','技能文件路径或元数据无效') from None
+        if len(skill['instructions'].encode()) > 8000:
+            raise DomainError('INVALID_ARGUMENT','技能内容超出预算')
+        attrs = {key:skill[key] for key in ('name','version','hash','estimated_tokens','duration_ms')}
+        self.select_skill(args['name'], progress)
+        active_trace.get().emit('skill_load', **attrs)
+        self.telemetry.emit('skill.loaded', **attrs)
+        self.emit('skill_activated', **attrs)
+        return {**attrs, 'guidance':skill['instructions']}
+
+    async def rewrite_knowledge(self, args, state, progress):
+        query = args['query']
+        if product_id := args.get('product_id'):
+            matches = any(hit.get('product_id') == product_id
+                          for event in progress['loop_observations']
+                          if event['name'] in TOOL_ARGS and event['result']['ok']
+                          for hit in event['result']['data'])
+            if not matches:
+                raise DomainError('INVALID_ARGUMENT', '请先查询该商品的图文候选')
+            name_from_catalog, _ = await asyncio.to_thread(
+                self.agent.multimodal.knowledge_scope, self.ctx.principal, product_id)
+            query = name_from_catalog + '：' + query
+        product = state.get('active_product_name')
+        if product and any(word in query for word in ('它','这个','这款','刚才')) and product not in query:
+            query = product+'：'+query
+            active_trace.get().emit('query_rewrite',reason='bound_product_reference',product_name=product)
+        return query if query != args['query'] else None
+
+    def record_knowledge(self, result, progress, tool_call_id):
+        chunks = result.data
+        evidence = {chunk['chunk_id']:chunk for chunk in progress['retrieved_chunks']}
+        evidence.update((chunk['chunk_id'], chunk) for chunk in clean(chunks))
+        progress['retrieved_chunks'] = list(evidence.values())
+        correlation = dict(server_id='retrieval', tool_name='search_knowledge', tool_call_id=tool_call_id,
+                           operation_id=result.operation_id, attempt_no=result.attempts)
+        active_trace.get().emit('retrieval', chunks=chunks, duration_ms=result.latency_ms, **correlation)
+        for event in ('rag.retrieved', 'rag.reranked'):
+            self.telemetry.emit(event, chunk_ids=[chunk['chunk_id'] for chunk in chunks], count=len(chunks),
+                                snapshot=chunks[0]['snapshot'] if chunks else None, **correlation)
+        return knowledge_observation(chunks)
+
     async def begin_refund(self, args, progress, preview):
         result, preview = await self.agent.refunds.prepare(self.ctx, self.services, args['order_id'], preview)
         self.refund_result = result
@@ -337,6 +324,7 @@ class AgentLoop:
         stopped = None
         error = None
         data = None
+        result = None
         try:
             if self.budget.tool_calls >= self.config.agent_max_tool_calls:
                 raise HarnessFailure('STEP_LIMIT_EXCEEDED')
@@ -347,14 +335,20 @@ class AgentLoop:
             progress['loop_seen'].append(signature)
             skill = TOOL_SKILLS.get(name)
             execution = dict(ctx=self.ctx,tool_name=name,arguments=args,budget=self.budget,telemetry=self.telemetry,proposal_id=ident)
-            if name in INTERNAL_SCHEMAS:
-                result = await self.services.tools.invoke_internal(**execution,handler=lambda values:self.internal(name,values,state,progress))
+            if name == 'load_skill':
+                result = await self.services.tools.invoke_internal(**execution,handler=lambda values:self.load_skill(values,progress))
             else:
-                result = await self.services.tools.invoke(**execution,skill_name=skill)
+                rewritten_query = await self.rewrite_knowledge(args,state,progress) if name == 'search_knowledge' else None
+                result = await self.services.tools.invoke(
+                    **execution, skill_name='product-consultation' if name in TOOL_ARGS else skill,
+                    rewritten_query=rewritten_query, required_max_price=self.visual_ceiling if name in TOOL_ARGS else None,
+                )
             envelope = result.envelope()
             data = result.data
             if name == 'begin_refund_workflow' and result.ok:
                 data = envelope['data'] = await self.begin_refund(args,progress,result.data)
+            elif name == 'search_knowledge' and result.ok:
+                data = envelope['data'] = self.record_knowledge(result,progress,ident)
             elif name == 'get_order' and result.ok and '退款' in self.text:
                 order = dict(result.data)
                 order['refund_status_reply'], order['refund_request'] = self.agent.refunds.status_for_order(
@@ -392,10 +386,14 @@ class AgentLoop:
                     proposed_hash = digest(json.dumps(call['args'], ensure_ascii=False, sort_keys=True))
                     self.emit('no_progress', tool_call_id=ident,repeated_signature=proposed_hash,count=2)
                 stopped = 'LIMIT'
+            elif name in RETRIEVAL_TOOLS and error in RETRIEVAL_UNAVAILABLE_ERRORS:
+                # A failed retrieval must not skip another tool in the batch.
+                pass
             elif error in STOP_ERRORS or error in {'MULTIMODAL_MODEL_NOT_READY', 'MULTIMODAL_ENCODER_ERROR', 'INDEX_NOT_READY'} or name in ('begin_refund_workflow','create_ticket') and self.budget.tool_calls > budget_before:
                 stopped = 'ERROR'
         evidence_ids = [chunk['chunk_id'] for chunk in progress['retrieved_chunks']] if name=='search_knowledge' and not error else []
-        observations.append(self.observation(call, error, data, evidence_ids, time.perf_counter()-started))
+        observations.append(self.observation(call, error, data, evidence_ids, time.perf_counter()-started,
+                                             operation_id=result.operation_id if result else None))
         if stopped:
             error = 'SKIPPED_DUE_TO_PENDING_APPROVAL' if progress['pending_confirmation'] else 'SKIPPED_AFTER_'+stopped
             observations.extend(self.observation(skipped, error) for skipped in calls[progress['batch_cursor']:])
@@ -430,13 +428,14 @@ class AgentLoop:
             return {'category':args['reason'],'summary':summary[:2000],'conversation_id':self.ctx.conversation_id}
         return args
 
-    def observation(self, call, error, data=None, evidence_ids=(), elapsed=0):
+    def observation(self, call, error, data=None, evidence_ids=(), elapsed=0, *, operation_id=None):
         name, ident = call['name'], call['id']
         content = {'ok':False,'error_code':error} if error else {'ok':True,'data':clean(data)}
         wire = json.dumps(content,ensure_ascii=False)
         if not error and len(wire.encode()) > max(self.config.context_tool_result_max_chars, 8500 if name=='load_skill' else 0):
             wire = self.compact_observation(name, data)
         self.emit('tool_observed',tool_call_id=ident,name=name,error_code=error,outcome=error or 'SUCCESS',
+                  operation_id=operation_id,
                   duration_ms=elapsed*1000,evidence_ids=list(evidence_ids))
         return ToolMessage(id=uid('obs-'),tool_call_id=ident,name=name,content=wire,status='error' if error else 'success')
 
@@ -524,9 +523,6 @@ class AgentLoop:
             progress['intent'] = {'get_orders':'order_query','get_order':'refund' if '退款' in self.text else 'order_query',
                            'track_shipment':'shipping_query','search_products':'product_consultation','create_ticket':'complaint'}.get(name,'refund')
 
-    def display_knowledge(self, chunks):
-        return '\n'.join(f"{row['content']} [{row['chunk_id']}] {row['document_title']} v{row['version']}" for row in chunks)
-
     def uses_direct_product_reply(self, state):
         tools = state['loop_observations']
         return (
@@ -559,7 +555,7 @@ class AgentLoop:
         ids = set(CITATION.findall(draft))
         valid_versions = all(ident in citations and str(citations[ident]['version'])==version.rstrip('.')
                              for ident, version in VERSIONED_CITATION.findall(draft))
-        if (not draft or FACT_MARKER.search(draft) or OUT_OF_SCOPE_STATUS.search(draft)
+        if (not draft or LEGACY_FACT_MARKER.search(draft) or self.unverified_write_claim(draft, ())
                 or not ids <= citations.keys() or not valid_versions
                 or used_memory_ids != {item.memory_id for item in live_memories}):
             self.emit('reply_composed',mode='PRODUCT_REPLY_FALLBACK',validation='MISSING_OR_UNVERIFIED_ANSWER')
@@ -572,26 +568,27 @@ class AgentLoop:
                           memory_ids=state['loop_memory_ids'])
         return draft
 
-    def reply_facts(self, state):
-        facts = {}
+    def offline_answer(self, state):
+        parts = []
         tools = state['loop_observations']
+        tracked_orders = {tool['args']['order_id'] for tool in tools
+                          if tool['name'] == 'track_shipment' and tool['result']['ok']}
         product_rows = []
         product_searched = False
-        labels = {'get_orders':'本人订单列表','get_order':'订单详情','track_shipment':'物流',
-                  'search_products':'实时商品','create_ticket':'人工工单',
-                  'check_refund_eligibility':'退款资格'}
         for tool in tools:
             name, result = tool['name'], tool['result']
             if name == 'search_products' and self.recommendation and result['ok']:
                 product_searched = True
                 product_rows.extend(result['data'])
                 continue
-            if name not in labels or not result['ok']:
+            if name not in BUSINESS_TOOLS or name == 'begin_refund_workflow' or not result['ok']:
                 continue
             if (self.refund_result and name in ('check_refund_eligibility', 'get_order')
                     and tool['args'].get('order_id') == self.refund_result.order_id):
                 continue
-            facts[f'B{len(facts)+1}'] = ReplyFact(labels[name], self.display_business(name,result['data'],tool['args'],state['loop_memory_ids']))
+            text = self.display_business(name, result['data'], tool['args'], state['loop_memory_ids'],
+                                         include_shipment_summary=tool['args'].get('order_id') not in tracked_orders)
+            parts.append(text)
         if product_searched:
             selected = self.agent.memory.revalidate(
                 self.ctx.principal,
@@ -599,29 +596,28 @@ class AgentLoop:
             )
             ceiling = budget_for(self.text, selected)
             candidates = self.recommendation_candidates(product_rows, selected, ceiling)
-            if selected:
+            if selected and self.ceiling is None:
                 preference = selected[0].content.strip()
                 if preference:
-                    facts[f'B{len(facts)+1}'] = ReplyFact(
-                        '相关用户偏好', '参考你保存的偏好：' + preference[:120],
-                    )
+                    parts.append('参考你保存的偏好：' + preference[:120])
             if candidates:
-                for item in candidates:
-                    facts[f'B{len(facts)+1}'] = ReplyFact(
-                        '商品候选', '实时商品信息：' + self.display_product(item), required=False,
-                        selection_group='product_candidate', product_id=item['id'], product_name=item['name'],
-                    )
+                candidate = candidates[0]
+                parts.append('实时商品信息：' + self.display_product(candidate))
+                self.emit('product_recommendation', product_ids=[candidate['id']], source='deterministic_candidate',
+                          memory_ids=state['loop_memory_ids'])
             else:
-                text = ('没有找到预算内的有库存商品。' if ceiling is not None
-                        else '当前目录中没有找到有库存的推荐商品。')
-                facts[f'B{len(facts)+1}'] = ReplyFact('商品查询结果', text)
-        if facts:
-            for number, row in enumerate(state['retrieved_chunks'], 1):
-                facts[f'K{number}'] = ReplyFact('知识证据',
-                    f"{row['content']} [{row['chunk_id']}] {row['document_title']} v{row['version']}")
-        return facts
+                parts.append('没有找到预算内的有库存商品。' if ceiling is not None
+                             else '当前目录中没有找到有库存的推荐商品。')
+        if state['retrieved_chunks']:
+            chunk = state['retrieved_chunks'][0]
+            parts.append(f"可参考《{chunk['document_title']}》 [{chunk['chunk_id']}] v{chunk['version']}")
+        if parts:
+            return '\n'.join(text.rstrip('。') + '。' for text in parts)
+        if any(tool['name'] == 'search_knowledge' for tool in tools):
+            return '没有足够的有效资料，请补充问题或转人工。'
+        return '您好，可以咨询商品、查询订单物流、申请退款或转人工。'
 
-    def display_business(self, name, data, arguments, memory_ids):
+    def display_business(self, name, data, arguments, memory_ids, *, include_shipment_summary=True):
         statuses = {'PAID':'已支付', 'SHIPPED':'已发货', 'DELIVERED':'已送达', 'CANCELLED':'已取消'}
         if name=='get_orders':
             if not data:
@@ -632,13 +628,25 @@ class AgentLoop:
             return data['refund_status_reply']
         if name=='get_order':
             cents = data['paid_amount_cents']
-            return f"订单 {data['id']} {statuses.get(data['status'],data['status'])}，实付 {cents//100}.{cents%100:02d} 元"
+            amount = f'{abs(cents)//100}.{abs(cents)%100:02d}'
+            paid = f'-{amount}' if cents < 0 else amount
+            answer = f"订单 {data['id']} {statuses.get(data['status'],data['status'])}，实付 {paid} 元"
+            items = []
+            for item in data.get('items', []):
+                title = item.get('product_name') or item.get('product_id') or '商品名称暂无记录'
+                quantity = item.get('quantity')
+                items.append(f'{title} × {quantity}' if quantity is not None else f'{title}（数量暂无记录）')
+            if items:
+                answer += '，商品：' + '、'.join(items)
+            if include_shipment_summary and 'shipments' in data:
+                entries = [self.display_shipment(row) for row in data['shipments']]
+                answer += '，物流：' + ('、'.join(entries) if entries else '暂无物流记录')
+            return answer
         if name=='track_shipment':
             order_id = arguments['order_id']
             if not data:
                 return f'订单 {order_id} 暂无可核验的物流记录'
-            entries = '；'.join(row['status'] + (f"（{row['carrier']}）" if row.get('carrier') else '') +
-                               (f"，运单号 {row['tracking_no']}" if row.get('tracking_no') and '单号' in self.text else '') for row in data)
+            entries = '；'.join(self.display_shipment(row, include_tracking='单号' in self.text) for row in data)
             return f'订单 {order_id} 的物流状态：{entries}'
         if name=='create_ticket':
             return '已创建人工工单：'+data['ticket_id']
@@ -661,6 +669,15 @@ class AgentLoop:
                 answer += '\n推荐时参考了你已保存的偏好：'+'；'.join(item.content for item in selected)+'。商品以核实后的参数为准。'
             return answer
         raise ValueError('No renderer for business tool')
+
+    @staticmethod
+    def display_shipment(row, *, include_tracking=False):
+        summary = row.get('status') or '状态待核实'
+        if row.get('carrier'):
+            summary += f"（{row['carrier']}）"
+        if include_tracking and row.get('tracking_no'):
+            summary += f"，运单号 {row['tracking_no']}"
+        return summary
 
     @staticmethod
     def display_product(item):
@@ -694,12 +711,77 @@ class AgentLoop:
                 summary += f'，保修 {warranty} 个月'
         return summary
 
+    @staticmethod
+    def unverified_write_claim(draft, business_results):
+        verified_receipts = {}
+        for tool in business_results:
+            if tool['name'] == 'get_order':
+                data = tool['result']['data']
+                receipt_text = data.get('refund_status_reply')
+                receipt = data.get('refund_request') or {}
+                if receipt_text:
+                    draft = draft.replace(receipt_text, '')
+                    if receipt.get('status') == 'ACCEPTED' and receipt.get('refund_request_id'):
+                        verified_receipts[receipt['refund_request_id']] = data['id']
+        for sentence in re.split(r'[。！？\n]', draft):
+            for claim in WRITE_STATUS.finditer(sentence):
+                if CLAIM_QUALIFIER.search(sentence[:claim.start()]):
+                    continue
+                if claim[0].startswith('退款申请') and claim[0].endswith('受理') and any(
+                    ident in sentence and set(ORDER_IDS.findall(sentence)) <= {order_id}
+                    for ident, order_id in verified_receipts.items()
+                ):
+                    continue
+                return True
+        return False
+
+    def direct_answer(self, state, citations, business_results):
+        history = state['loop_messages']
+        draft = history[-1].content.strip() if history and isinstance(history[-1], AIMessage) else ''
+        reason, error = state['terminal_reason'], state['loop_error']
+        if reason == 'LIMIT':
+            return '已停止重复或超限的查询；如需继续，请缩小问题范围。', reason
+        ids = set(CITATION.findall(draft))
+        valid_versions = all(ident in citations and str(citations[ident]['version']) == version.rstrip('.')
+                             for ident, version in VERSIONED_CITATION.findall(draft))
+        validation = None
+        if self.unverified_write_claim(draft, business_results):
+            validation = 'UNVERIFIED_WRITE_CLAIM'
+        elif ids - citations.keys() or not valid_versions:
+            validation = 'UNVERIFIED_CITATION'
+        elif citations and not business_results and not ids and not self.refund_result:
+            validation = 'MISSING_CITATION'
+        elif LEGACY_FACT_MARKER.search(draft) or (not business_results and not citations and (ORDER_IDS.search(draft) or CLAIM.search(draft))):
+            validation = 'UNVERIFIED_ANSWER'
+        # Keep a tool outage visible when no answerable result was obtained.
+        can_use_draft = not error or error == 'INVALID_ARGUMENT' or business_results or citations
+        if draft and not validation and can_use_draft:
+            self.emit('reply_composed', mode='MODEL_DIRECT', validation='REFERENCE_CHECK_PASSED')
+            if re.search(r'请.{0,6}(?:提供|补充)|请问|哪一单', draft) and not (business_results or citations):
+                if self.text.strip('，。！？?! ').lower() not in ('你好','您好','hi','hello'):
+                    reason = 'NEEDS_INPUT'
+            return draft, reason
+        if validation:
+            self.emit('reply_composed', mode='REJECTED', validation=validation)
+        if self.refund_result:
+            return '', reason
+        if error:
+            if reason == 'COMPLETED':
+                reason = 'NEEDS_INPUT' if error == 'INVALID_ARGUMENT' else 'ERROR'
+            return '查询结果未能确认，请核对信息后重试。', reason
+        if validation or business_results or citations:
+            return '暂未得到可核实的答复，请稍后重试。', 'ERROR'
+        if any(tool['name'] == 'search_knowledge' for tool in state['loop_observations']):
+            return '没有足够的有效资料，请补充问题或转人工。', 'NEEDS_INPUT'
+        return '未获得可核验的信息，请补充具体问题或订单号。', 'NEEDS_INPUT'
+
     async def finish(self, state):
-        history=state['loop_messages']; reason=state['terminal_reason']
+        reason=state['terminal_reason']
         pending = state['pending_confirmation']
         citations = {row['chunk_id']:row for row in state['retrieved_chunks']}
         error = state['loop_error']
         tools = state['loop_observations']
+        business_results = [tool for tool in tools if tool['name'] in BUSINESS_TOOLS and tool['result']['ok']]
         if pending:
             cents=pending['amount_cents']; oid=pending['order_id']
             answer=f'订单 {oid}，退款金额 {cents//100}.{cents%100:02d} 元。请通过确认按钮确认退款申请。'
@@ -707,80 +789,14 @@ class AgentLoop:
                 answer='已有待确认申请，请使用原确认按钮；如凭据丢失，请取消后重新申请。'
         elif self.uses_direct_product_reply(state):
             answer = self.product_answer(state, citations)
+        elif reason == 'HANDOFF':
+            ticket = next(tool['result']['data'] for tool in business_results if tool['name'] == 'create_ticket')
+            answer = '已创建人工工单：' + ticket['ticket_id'] + '。'
         else:
-            draft=history[-1].content if history and not isinstance(history[-1],ToolMessage) else ''
-            facts=self.reply_facts(state)
-            parts=[]
-            if facts:
-                rendered, validation = render_checked(draft, facts)
-                selected_products = []
-                selection_source = 'model_fact_selection'
-                if rendered:
-                    parts.append(rendered)
-                    selected_products = [facts[match.group(1)].product_id for match in FACT_MARKER.finditer(draft)
-                                         if match.group(1) in facts and facts[match.group(1)].selection_group == 'product_candidate']
-                else:
-                    required_facts = [fact.text.rstrip('。')+'。' for key,fact in facts.items()
-                                      if key.startswith('B') and fact.required]
-                    product_candidates = [(key, fact) for key, fact in facts.items()
-                                          if key.startswith('B') and fact.selection_group == 'product_candidate']
-                    requested = next((facts[match.group(1)] for match in FACT_MARKER.finditer(draft)
-                                      if match.group(1) in facts and facts[match.group(1)].selection_group == 'product_candidate'), None)
-                    if product_candidates and requested is None:
-                        mentioned = [(key, fact) for key, fact in product_candidates
-                                     if fact.product_name and fact.product_name in draft]
-                        if len(mentioned) == 1:
-                            requested = mentioned[0][1]
-                            selection_source = 'model_answer_product_name'
-                        elif len(product_candidates) == 1:
-                            requested = product_candidates[0][1]
-                            selection_source = 'single_verified_candidate'
-                    if product_candidates and requested is None:
-                        parts.append('已查询到在售商品。请补充你更看重的佩戴形式、降噪或设备连接需求。')
-                    else:
-                        parts.extend(required_facts)
-                        if requested is not None:
-                            parts.append(requested.text.rstrip('。')+'。')
-                            if requested.product_id:
-                                selected_products = [requested.product_id]
-                                if selection_source == 'model_fact_selection':
-                                    selection_source = 'verified_fact_fallback'
-                    if citations:
-                        parts.insert(0,self.display_knowledge(citations.values()))
-                self.emit('reply_composed',mode='MODEL_TEMPLATE' if rendered else 'VERIFIED_FALLBACK',
-                          validation=validation,fact_count=len(facts))
-                if selected_products:
-                    self.emit('product_recommendation', product_ids=selected_products,
-                              source=selection_source, memory_ids=state['loop_memory_ids'])
-                latest = {message.name:message.status for message in history if isinstance(message,ToolMessage)}
-                if reason!='LIMIT' and any(status=='error' for name,status in latest.items() if name!='load_skill'):
-                    parts.append('另有查询结果未能确认，请核对信息后重试。')
-            ids=set(CITATION.findall(draft))
-            if citations and not facts:
-                versions_ok=all(ident in citations and str(citations[ident]['version'])==version.rstrip('.')
-                                for ident,version in VERSIONED_CITATION.findall(draft))
-                parts.insert(0,draft if not self.refund_result and ids and ids<=citations.keys() and versions_ok and not CLAIM.search(draft)
-                             and not FACT_MARKER.search(draft) else self.display_knowledge(citations.values()))
-            if reason=='LIMIT':
-                parts.append('已停止重复或超限的查询；如需继续，请缩小问题范围。')
-            if not parts and not self.refund_result:
-                if error:
-                    parts.append('查询结果未能确认，请核对信息后重试。')
-                    if reason=='COMPLETED': reason='NEEDS_INPUT' if error=='INVALID_ARGUMENT' else 'ERROR'
-                elif any(tool['name']=='search_knowledge' for tool in tools):
-                    parts.append('没有足够的有效资料，请补充问题或转人工。')
-                elif not draft or ids or FACT_MARKER.search(draft) or ORDER_IDS.search(draft) or CLAIM.search(draft):
-                    parts.append('未获得可核验的信息，请补充具体问题或订单号。')
-                    reason='NEEDS_INPUT'
-                elif re.search(r'请.{0,6}(?:提供|补充)|请问|哪一单',draft):
-                    parts.append(draft)
-                    if not self.text.strip('，。！？?! ') in ('你好','您好','hi','hello'):
-                        reason='NEEDS_INPUT'
-                else:
-                    parts.append(draft)
-            answer='\n'.join(parts)
+            answer, reason = self.direct_answer(state, citations, business_results)
         visual_events = [tool for tool in tools if tool['name'] in TOOL_ARGS]
         cards = None
+        descriptions = []
         if visual_events:
             cards = await asyncio.to_thread(self.agent.multimodal.revalidate_cards, self.ctx.principal,
                                             visual_events, self.visual_ceiling)
@@ -795,10 +811,9 @@ class AgentLoop:
             else:
                 visual_answer = '当前没有可展示的商品图片候选。'
             if not pending:
-                has_verified_answer = bool(citations or self.reply_facts(state))
-                answer = '\n'.join((answer, visual_answer)) if has_verified_answer else visual_answer
+                answer = '\n'.join((answer, visual_answer)) if citations or business_results else visual_answer
         if (self.services.image_ids and not self.services.allow_external_image_send
-                and not visual_events and not pending and not citations and not self.reply_facts(state)):
+                and not visual_events and not pending and not citations and not business_results):
             answer = '这次仅能使用本地图片检索，尚未取得可用候选。请补充图片中的商品、型号或订单号。'
             if reason == 'COMPLETED':
                 reason = 'NEEDS_INPUT'
@@ -812,6 +827,17 @@ class AgentLoop:
         if error in visual_errors and reason == 'ERROR':
             answer = visual_errors[error]
             active_trace.get().emit('error', status='error', error_code=error)
+        unavailable = {tool['name']: tool['result']['error']['code'] for tool in tools
+                       if tool['name'] in RETRIEVAL_TOOLS and not tool['result']['ok']
+                       and tool['result']['error']['code'] in RETRIEVAL_UNAVAILABLE_ERRORS}
+        if unavailable:
+            notice = '知识服务暂不可用，请稍后重试。' if 'search_knowledge' in unavailable else '商品图文检索暂不可用，请稍后重试。'
+            verified = pending or self.refund_result or citations or business_results or cards or descriptions
+            answer = '\n'.join(filter(None, (answer if verified else None, notice)))
+            if not verified:
+                reason = 'ERROR'
+            kind = 'retrieval.unavailable' if verified else 'error'
+            active_trace.get().emit(kind, status='error', error_code=next(iter(unavailable.values())))
         if error in STOP_ERRORS | {'UPSTREAM_UNAVAILABLE','KNOWLEDGE_NOT_READY','TOOL_TIMEOUT','TOOL_UPSTREAM_ERROR','TOOL_BAD_RESULT'} and reason=='ERROR':
             active_trace.get().emit('error', status='error',error_code=error)
         recorder=active_trace.get()

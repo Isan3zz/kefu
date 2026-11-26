@@ -4,6 +4,7 @@ from app.business import Actor, DomainError
 from app.db import memories, memory_revisions
 from app.memory.contracts import MemoryInput
 from app.memory.service import MemoryService
+from app.rag import RAG
 
 
 @pytest.mark.asyncio
@@ -45,3 +46,21 @@ async def test_memory_storage_owner_version_delete_and_rebuild(env, monkeypatch)
     monkeypatch.setattr(service.index, 'sync', backup)
     await service.sync_index()
     assert service.index.collection().get(ids=[stored.memory_id])['ids'] == []
+
+
+async def test_memory_projection_rehydrates_existing_rows_in_separate_store(env, tmp_path):
+    principal = env['a']
+    original = MemoryService(env['b'], env['rag'], env['cfg'])
+    stored = await original.create_memory(principal=principal, data=MemoryInput(
+        memory_type='preference', subject_key='headphones.style', content='我喜欢头戴式耳机'))
+    config = env['cfg'].model_copy(update={'chroma_path': str(tmp_path/'separate-memory')})
+    projection = RAG(env['db'], env['rag'].models, config)
+    service = MemoryService(env['b'], projection, config)
+    try:
+        service.index.queue_missing_projection(service.repository)
+        await service.sync_index()
+        hits = await service.search(principal=principal, query='头戴式耳机')
+        assert [item.memory_id for item in hits] == [stored.memory_id]
+        assert not await service.search(principal=env['other'], query='头戴式耳机')
+    finally:
+        projection.close()

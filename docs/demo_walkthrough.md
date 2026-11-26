@@ -1,4 +1,4 @@
-# 本地双进程演示
+# 本地三进程演示
 
 完整演示使用真实本地 BGE 检索和显式 `deterministic` 路由，不调用主 LLM。先按 README 安装 `.venv` 和模型。下面创建新目录，避免覆盖已有退款记录。
 
@@ -9,7 +9,9 @@
 $env:SQLITE_URL='sqlite:///./data/demo-new/app.db'
 $env:CHECKPOINT_DB_PATH='data/demo-new/checkpoints.db'
 $env:CHROMA_PATH='data/demo-new/chroma'
+$env:MEMORY_CHROMA_PATH='data/demo-new/memory_chroma'
 $env:BM25_INDEX_PATH='data/demo-new/bm25'
+$env:MULTIMODAL_IMAGE_PATH='data/demo-new/images'
 $env:OMP_NUM_THREADS='8'
 $env:MKL_NUM_THREADS='8'
 ```
@@ -22,7 +24,7 @@ python -m scripts.init_db
 python -m scripts.build_kb
 ```
 
-第一个终端执行 `python -m app.mcp`，第二个执行 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`。访问 Swagger `http://127.0.0.1:8000/docs`，或第三个终端执行：
+在三个终端分别执行 `python -m app.mcp`、`python -m app.retrieval_mcp` 和 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`。访问 Swagger，或在另一个终端执行以下命令。
 
 ```powershell
 python -m scripts.demo

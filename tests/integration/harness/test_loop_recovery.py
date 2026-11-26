@@ -17,12 +17,16 @@ from app.db import DB, agent_invocations, refund_requests, tickets, workflow_ins
 from app.fakes import FakeModels
 from app.mcp import Gateway, create_mcp
 from app.rag import RAG
+from app.retrieval_mcp import RetrievalService, create_retrieval_mcp
 
 
 async def crash_chat(scenario, conversation_id, text):
     business = Business(DB(settings.sqlite_url))
-    gateway = Gateway(business, settings, create_mcp(business, settings.mcp_service_secret, testing=True))
-    agent = Agent(business, gateway, settings, RAG(business.db, FakeModels(), settings))
+    rag = RAG(business.db, FakeModels(), settings)
+    retrieval = create_retrieval_mcp(RetrievalService(business, settings, rag=rag), settings)
+    gateway = Gateway(business, settings, create_mcp(business, settings.business_secret, testing=True),
+                      retrieval_server=retrieval)
+    agent = Agent(business, gateway, settings, rag)
     dispatch = gateway._call
     if scenario == 'batch':
         def call(name, arguments):
@@ -88,6 +92,7 @@ async def checkpoint(env, thread_id=None):
 
 async def test_loop_saved_observations_before_dispatching_next_tool(env):
     env['rag'].build('knowledge')
+    env['rag'].close()
     text = '帮我查售后政策和订单，再转人工'
     invocation = await crash_process(env, 'batch', text)
     state = await checkpoint(env)

@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "dataset_split": "fault_injection",
+  "provenance": "Local pytest fixtures, protocol mocks and loopback MCP processes",
+  "scenarios": [
+    {"id":"model-429","pytest":"tests/test_eval_fault_matrix.py::test_transient_model_failure_recovers_once[429]","expect":"Retry once and complete"},
+    {"id":"model-503","pytest":"tests/test_eval_fault_matrix.py::test_transient_model_failure_recovers_once[503]","expect":"Recover after temporary 5xx"},
+    {"id":"model-timeout","pytest":"tests/test_eval_fault_matrix.py::test_transient_model_failure_recovers_once[timeout]","expect":"Bound per-attempt duration and retry"},
+    {"id":"mcp-connection-failed","pytest":"tests/test_retrieval_mcp.py::test_http_timeout_isolation_correlation_and_multiturn","expect":"Transport retries retain one logical operation ID"},
+    {"id":"retrieval-mcp-down","pytest":"tests/test_retrieval_mcp.py::test_http_timeout_isolation_correlation_and_multiturn","expect":"Degrade retrieval while order lookup remains available"},
+    {"id":"business-mcp-down","pytest":"tests/test_retrieval_mcp.py::test_http_works_with_business_offline","expect":"Order lookup fails and knowledge retrieval still works"},
+    {"id":"rag-snapshot-missing","pytest":"tests/test_eval_fault_matrix.py::test_missing_rag_index_degrades_while_orders_work","expect":"No invented citations and a separate order lookup succeeds"},
+    {"id":"invalid-tool-schema","pytest":"tests/unit/harness/test_gateways.py::test_H11_transport_protocol_and_bad_results","expect":"Malformed result is rejected"},
+    {"id":"refund-response-lost","pytest":"tests/integration/harness/test_runtime.py::test_H13_timeout_after_refund_commit_reconciles_original_key","expect":"Reconcile the original idempotency key with one receipt"},
+    {"id":"refund-receipt-missing","pytest":"tests/test_refund_result_guard.py::test_submit_success_without_business_receipt_cannot_finish_workflow","expect":"No false success; unknown remains unresolved"},
+    {"id":"duplicate-client-request","pytest":"tests/integration/harness/test_runtime.py::test_H17_api_idempotency_replay_and_conflict","expect":"Replay same request; reject conflicting payload"},
+    {"id":"duplicate-refund-confirmation","pytest":"tests/test_acceptance.py::test_T04_duplicate_and_concurrent","expect":"One receipt on concurrent confirmation"},
+    {"id":"duplicate-agent-tool","pytest":"tests/test_openai_adapter.py::test_L19_repeat_does_not_dispatch_twice","expect":"Repeated proposal is stopped before dispatch"},
+    {"id":"agent-step-budget","pytest":"tests/test_openai_adapter.py::test_L18_steps_and_tool_limit","expect":"Enforce step and tool budgets"},
+    {"id":"stale-memory-projection","pytest":"tests/test_eval_fault_matrix.py::test_stale_active_memory_projection_is_ignored","expect":"Ignore old revision then synchronize from SQLite"},
+    {"id":"request-deadline","pytest":"tests/integration/harness/test_runtime.py::test_H06_global_timeout_marks_invocation_and_stops_new_calls","expect":"Stop scheduling on deadline"}
+  ]
+}

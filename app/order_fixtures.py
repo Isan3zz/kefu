@@ -210,6 +210,9 @@ def evaluate_order_boundary_oracle(db: DB) -> dict:
     with db.tx() as connection:
         actor_rows = connection.execute(select(users.c.id, users.c.tenant_id, users.c.role)).all()
         actors = {user_id: Actor(user_id, tenant_id, role) for user_id, tenant_id, role in actor_rows}
+        product_names = {(tenant, product_id): name for tenant, product_id, name in connection.execute(
+            select(products.c.tenant_id, products.c.id, products.c.name)
+        )}
         before_refund_ids = set(connection.scalars(select(refund_requests.c.id)))
 
     source_orders = {row["id"]: row for row in data["orders"]}
@@ -255,7 +258,8 @@ def evaluate_order_boundary_oracle(db: DB) -> dict:
             owner_shipments = []
             shipment_access = error.code
         source_items = sorted(
-            (row for row in data["order_items"] if row["order_id"] == order_id), key=lambda row: row["id"]
+            (row | {'product_name': product_names.get((owner.tenant_id, row['product_id']))}
+             for row in data["order_items"] if row["order_id"] == order_id), key=lambda row: row["id"]
         )
         source_shipments = sorted(
             (row for row in data["shipments"] if row["order_id"] == order_id), key=lambda row: row["id"]

@@ -42,10 +42,27 @@ class Settings(BaseSettings):
     agent_timeout_seconds: int = 90
     mcp_base_url: str = "http://127.0.0.1:8001/mcp"
     mcp_service_secret: str = "CHANGE_ME_INTERNAL_ONLY"
+    business_mcp_url: str | None = None
+    business_mcp_service_secret: str | None = None
+    business_mcp_host: str = "127.0.0.1"
+    business_mcp_port: int = Field(default=8001, ge=1, le=65535)
+    business_mcp_enabled: bool = True
+    retrieval_mcp_url: str = "http://127.0.0.1:8002/mcp"
+    retrieval_mcp_service_secret: str = "CHANGE_ME_RETRIEVAL_ONLY"
+    retrieval_mcp_host: str = "127.0.0.1"
+    retrieval_mcp_port: int = Field(default=8002, ge=1, le=65535)
+    retrieval_mcp_enabled: bool = True
+    retrieval_mcp_timeout_seconds: float | None = Field(default=None, gt=0)
+    memory_chroma_path: str = "data/memory_chroma"
     judge_enabled: bool = False
     judge_base_url: str = ""
     judge_api_key: str = ""
     judge_model: str = ""
+    judge_timeout_seconds: float = Field(default=15, gt=0)
+    judge_max_retries: int = Field(default=0, ge=0)
+    judge_max_output_tokens: int = Field(default=1500, gt=0)
+    judge_context_max_input_tokens: int = Field(default=64000, gt=0)
+    judge_json_mode: bool = True
     trace_content_enabled: bool = False
     harness_enabled: bool = True
     harness_trace_enabled: bool = True
@@ -66,6 +83,7 @@ class Settings(BaseSettings):
     model_json_mode: bool = False
     repeated_action_limit: int = Field(default=3,ge=2)
     memory_enabled: bool = True
+    memory_context_mode: Literal['profile', 'semantic'] = 'profile'
     memory_opt_in_default: bool = False
     memory_top_k: int = Field(default=5, ge=1, le=5)
     memory_candidate_k: int = Field(default=15, ge=5, le=100)
@@ -110,8 +128,22 @@ class Settings(BaseSettings):
     vlm_supports_vision: bool = False
     vlm_supports_tool_calling: bool = False
 
+    @property
+    def business_endpoint(self):
+        return self.business_mcp_url or self.mcp_base_url
+
+    @property
+    def business_secret(self):
+        return self.business_mcp_service_secret or self.mcp_service_secret
+
     @model_validator(mode='after')
     def context_capacity(self):
+        if not self.retrieval_mcp_service_secret or self.retrieval_mcp_service_secret == self.business_secret:
+            raise ValueError('Business and Retrieval MCP require distinct service secrets')
+        if self.business_mcp_enabled and self.retrieval_mcp_enabled and self.business_endpoint.rstrip('/') == self.retrieval_mcp_url.rstrip('/'):
+            raise ValueError('Business and Retrieval MCP require distinct endpoints')
+        if Path(self.memory_chroma_path).resolve() == Path(self.chroma_path).resolve():
+            raise ValueError('Memory and retrieval require separate embedded Chroma directories')
         if not self.chinese_clip_local_only or self.multimodal_index_on_upload:
             raise ValueError('Chinese-CLIP requires local files and user uploads must stay outside the catalog index')
         if self.context_max_input_tokens>self.model_context_window-self.context_reserved_output_tokens-self.context_safety_margin_tokens:

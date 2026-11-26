@@ -43,7 +43,9 @@ class MultimodalIndex:
                 return None
             return client.get_or_create_collection(
                 self.names[kind], embedding_function=None,
-                configuration={'hnsw': {'space': 'cosine'}},
+                # Jobs update one row at a time. Persist its HNSW metadata
+                # before a separate Retrieval process opens a small catalog.
+                configuration={'hnsw': {'space': 'cosine', 'sync_threshold': 1}},
                 metadata=self.model_metadata(),
             )
 

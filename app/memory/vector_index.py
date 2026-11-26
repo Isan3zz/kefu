@@ -38,6 +38,17 @@ class ChromaMemoryIndex:
         return [(ident, 1 - distance, metadata) for ident, distance, metadata in
                 zip(result['ids'][0], result['distances'][0], result['metadatas'][0], strict=True)]
 
+    def queue_missing_projection(self, repository):
+        """Rehydrate existing SQLite memories when starting with a fresh Chroma directory."""
+        criteria = (*active(repository.stamp()), memories.c.index_pending == 0)
+        with repository.db.tx() as connection:
+            if connection.execute(select(memories.c.id).where(*criteria).limit(1)).first() is None:
+                return
+        if self.name in {item.name for item in self.rag.client().list_collections()}:
+            return
+        with repository.db.tx() as connection:
+            connection.execute(memories.update().where(*criteria).values(index_pending=1, embedding_version=None))
+
     def sync(self, repository, memory_id):
         with repository.db.tx() as connection:
             snapshot = connection.execute(select(memories).where(memories.c.id == memory_id)).mappings().first()

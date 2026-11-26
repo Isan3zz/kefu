@@ -22,7 +22,7 @@ python -m scripts.init_db
 
 不激活时可把 `python` 换成 `.\.venv\Scripts\python.exe`。Linux 使用 `source .venv/bin/activate`。`uv.lock` 保存实际解析版本，安装不要主动升级锁文件。
 
-`.env` 中配置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。两个进程的 `MCP_SERVICE_SECRET` 必须相同。默认值只用于本机演示。不要提交真实密钥。
+真实聊天在 `.env` 中配置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。API 分别用 `BUSINESS_MCP_URL`、`RETRIEVAL_MCP_URL` 连接两个服务。每个服务与 API 使用对应的 `*_MCP_SERVICE_SECRET`，两组密钥必须不同。样例密钥仅供本机演示。旧 `MCP_BASE_URL` 和 `MCP_SERVICE_SECRET` 仍可作为 Business 配置的后备值。
 
 ## 显式下载和校验本地模型
 
@@ -47,10 +47,14 @@ python -m scripts.download_models --all --http-range --disable-xet --workers 16 
 
 ## 启动和演示
 
-两个已激活 `.venv` 的终端分别执行：
+在三个已激活 `.venv` 的终端从项目根目录分别执行。
 
 ```powershell
 python -m app.mcp
+```
+
+```powershell
+python -m app.retrieval_mcp
 ```
 
 ```powershell
@@ -59,20 +63,34 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 访问 [Swagger](http://127.0.0.1:8000/docs)。在 demo-login 输入 `{"demo_user_key":"user_a"}`，将响应中的 token 填入请求的 `Authorization: Bearer <token>` header。可选用户：`user_a`（租户 a）、`user_b`（租户 b）、`admin`（租户 a）。
 
-聊天默认 `mode=real`，缺少 API 配置返回 503。显式 `mode=deterministic` 使用规则测试路由，适合离线业务演示；不会自动用 Fake 模型构建正式知识索引。无本地知识索引时知识咨询返回 503，其余订单与退款功能正常。
+聊天默认 `mode=real`，缺少 API 配置返回 503。显式 `mode=deterministic` 只替换决策模型，检索仍通过 Retrieval MCP 使用真实本地索引和权重。知识索引或 Retrieval MCP 不可用时，知识查询明确提示服务暂不可用，订单、物流与退款确认仍可执行。Business MCP 不可用时，知识检索仍可执行。
+
+Business 默认监听 `127.0.0.1:8001`，Retrieval 默认监听 `127.0.0.1:8002`。各自的 `*_MCP_HOST` 和 `*_MCP_PORT` 控制监听。三个进程共享同一份 `SQLITE_URL`。API 和 Retrieval 共享 `MULTIMODAL_IMAGE_PATH`，由 API 上传或删除、Retrieval 读取。Retrieval 独占 `CHROMA_PATH` 与 `BM25_INDEX_PATH`，API 的记忆索引使用 `MEMORY_CHROMA_PATH`。运行索引写入脚本前先停止 Retrieval。管理员也可通过 Swagger 的知识库重建接口在 Retrieval 进程内串行重建。详见 [架构与部署约束](docs/architecture.md)。
 
 ```powershell
 python -m scripts.demo
 ```
 
-完整脚本要求知识索引就绪，展示政策引用、订单列表、第二单物流、退款预览、插入产品问题、确认、重复确认、退款进度与人工工单。种子 O1001 送达两天、O1002 已发货、O1003 已支付且待发货、O1004 超过七天，O2001 属于另一租户。退款有实际副作用，seed 幂等，不会删除已受理记录。全新演示需将 `SQLITE_URL`、`CHECKPOINT_DB_PATH`、`CHROMA_PATH` 和 `BM25_INDEX_PATH` 指向新目录，迁移、初始化并重建该数据库的索引；两个服务使用相同配置。详细命令见 [演示步骤](docs/demo_walkthrough.md)。
+完整脚本要求知识索引就绪，展示政策引用、订单列表、第二单物流、退款预览、插入产品问题、确认、重复确认、退款进度与人工工单。种子 O1001 送达两天、O1002 已发货、O1003 已支付且待发货、O1004 超过七天，O2001 属于另一租户。退款有实际副作用，seed 幂等，保留已受理记录。全新演示需使用隔离的 SQLite、检查点、检索索引、记忆索引和图片目录。详细命令见 [演示步骤](docs/demo_walkthrough.md)。
 
 退款的 `confirm_nonce` 仅在预览响应出现一次，客户端须保留直到确认；数据库和 checkpoint 不保存明文。凭据十五分钟有效，过期需重新申请。不要在普通聊天里发送 nonce。查询 workflow 不能重新获取 nonce。
 
 ## 测试和评测
 
+Evaluation v3 将执行轨迹、SQLite 业务结果和用户可见回答分开打分。新增验证集、冻结留出集、故障矩阵和独立 Judge 校准集。历史 100 条及旧命令仍可运行。每次评测生成 JSON、Markdown、HTML 及 SQLite Trace 索引。
+
+```powershell
+uv run python -m scripts.run_eval --dataset datasets/validation/commerce_v1.jsonl --agent-release validation-baseline
+uv run python -m scripts.run_eval_faults
+uv run python -m scripts.run_eval --rescore-run RUN_ID
+uv run python -m scripts.compare_runs --baseline BASE_ID --candidate NEW_ID --enforce
+```
+
+留出集 `datasets/holdout/commerce_v1.jsonl` 供最终验收使用。评测器校验数据、场景组和独立业务 fixture 的冻结 hash。真实 Judge 使用独立的 `JUDGE_*` 配置，经 `--mode judge --run-id RUN_ID` 对既有证据评分。已授权的 `agent-real` 运行也可显式加 `--enable-judge`。仪表、门禁策略和人工复核流程见 [评测说明](docs/evaluation.md#evaluation-v3)。
+
 ```powershell
 python -m pytest -q -m "not real"
+python -m pytest -q tests/test_retrieval_mcp.py
 python -m scripts.run_eval --dataset datasets/workflow.jsonl --mode deterministic --agent-release agent-v1
 python -m scripts.run_experiments
 ```
@@ -193,7 +211,7 @@ python -m scripts.rebuild_memory_index --dry-run
 
 ### 下载权重与导入商品图
 
-在项目根目录执行。图片导入及重建期间请停止使用同一个 Chroma 路径的 API 进程。
+在项目根目录执行。图片导入及重建期间请停止使用同一个 Chroma 路径的 Retrieval MCP 进程。
 
 ```powershell
 python -m alembic upgrade head
@@ -211,7 +229,7 @@ python scripts/rebuild_multimodal_index.py --target all
 python scripts/rebuild_multimodal_index.py --target all --retry
 ```
 
-导入先保存 SQLite 和文件，再执行索引作业。可用 `--queue-only` 延迟编码。失败或中断后的索引作业可通过 `--retry` 收敛。重建仅读取 SQLite 有效记录，处理范围限于 `mm_product_images_v1` 和 `mm_visual_texts_v1`。索引 manifest 位于 `CHROMA_PATH/multimodal_index_manifest.json`。图片储存在 `MULTIMODAL_IMAGE_PATH` 下，由鉴权 API 读取。私有上传默认一天过期，过期即拒绝读取，重建或重试命令同时清理过期文件。
+导入先保存 SQLite 和文件，再执行索引作业。可用 `--queue-only` 延迟编码。失败或中断后的索引作业可通过 `--retry` 收敛。重建仅读取 SQLite 有效记录，处理范围限于 `mm_product_images_v1` 和 `mm_visual_texts_v1`。索引 manifest 位于 `CHROMA_PATH/multimodal_index_manifest.json`。图片保存于 `MULTIMODAL_IMAGE_PATH`。API 删除后 SQLite 会立即撤销访问，待处理的商品向量删除由索引脚本执行。私有上传默认一天过期，过期即拒绝读取，重建或重试命令同时清理过期文件。
 
 ### 上传与查询
 
