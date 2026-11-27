@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     agent_max_steps: int = 8
     agent_max_tool_calls: PositiveInt = 12
     agent_timeout_seconds: int = 90
+    task_manager_enabled: bool = False
     mcp_base_url: str = "http://127.0.0.1:8001/mcp"
     mcp_service_secret: str = "CHANGE_ME_INTERNAL_ONLY"
     business_mcp_url: str | None = None

@@ -213,8 +213,10 @@ def release(config):
     for path in sorted((ROOT/'app').rglob('*.py')):
         source.update(str(path.relative_to(ROOT)).encode()); source.update(path.read_bytes())
     lock=ROOT/'uv.lock'
-    from app.agent_loop import PROMPT_VERSION
-    return dict(git_commit=commit,source_sha256=source.hexdigest(),uv_lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,llm=config.llm_model,temperature=0,prompt=PROMPT_VERSION,prompts={'loop':PROMPT_VERSION},skills={n:sm.load(n)['hash'] for n in sm.catalog},tool_schema=TOOL_SCHEMA_VERSION,models=model_manifest(),policy='P-REFUND-v1',evaluator=EVALUATOR_VERSION,evaluator_sha256=evaluator_sha256(),chunker=CHUNKER_VERSION)
+    from app.agent_loop import PROMPT_VERSION, TASK_PROMPT_VERSION
+    prompt = TASK_PROMPT_VERSION if config.task_manager_enabled else PROMPT_VERSION
+    tool_schema = TOOL_SCHEMA_VERSION + ('+order-check-plan-v1' if config.task_manager_enabled else '')
+    return dict(git_commit=commit,source_sha256=source.hexdigest(),uv_lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,llm=config.llm_model,temperature=0,prompt=prompt,prompts={'loop':prompt},skills={n:sm.load(n)['hash'] for n in sm.catalog},tool_schema=tool_schema,models=model_manifest(),policy='P-REFUND-v1',evaluator=EVALUATOR_VERSION,evaluator_sha256=evaluator_sha256(),chunker=CHUNKER_VERSION)
 
 async def run(dataset,mode='deterministic',agent_release='local',config=settings,retrieval_mode='hybrid_rerank',skill_mode='selected',inject_unsafe_action=False,*,enable_judge=False):
     raw,cases=load_dataset(dataset)
@@ -223,6 +225,7 @@ async def run(dataset,mode='deterministic',agent_release='local',config=settings
     if mode=='agent-real': Agent(Business(DB(config.sqlite_url)),None,config).llm()
     if enable_judge and mode != 'agent-real': raise ValueError('Inline Judge requires agent-real; score existing runs with judge mode')
     report=dict(run_id=uid('run-'),created_at=now(),mode=mode,agent_release=agent_release,dataset_sha256=hashlib.sha256(raw).hexdigest(),release=release(config),retrieval_mode=retrieval_mode,skill_mode=skill_mode,cases=[])
+    report['task_manager_enabled'] = config.task_manager_enabled
     split=cases[0].get('dataset_split', 'regression' if Path(dataset).name=='regression.jsonl' else 'fault_injection' if Path(dataset).name=='fault_baseline.jsonl' else 'development')
     report['dataset']={'name':Path(dataset).name,'split':split,'schema_versions':sorted({case['schema_version'] for case in cases}),
                        'sha256':report['dataset_sha256'],'case_count':len(cases)}
@@ -584,7 +587,7 @@ def compare(baseline,candidate,policy=None,*,vary=()):
                 harness_deltas=harness_delta,baseline_harness_config=baseline.get('harness_config'),
                 candidate_harness_config=candidate.get('harness_config'),baseline_release=baseline['release'],
                 candidate_release=candidate['release'],fixture=baseline.get('fixture'),knowledge_changed='knowledge' in differences,
-                latency=pair('latency'),agent_latency=pair('agent_latency'),tokens=pair('usage_by_role'),
+                latency=pair('latency'),agent_latency=pair('agent_latency'),tokens=pair('usage_by_role'),loop=pair('loop'),
                 cost={'baseline':old_cost,'candidate':new_cost,'delta':delta},failure_categories=pair('failure_categories'),
                 failure_attribution=pair('failure_attribution'))
 

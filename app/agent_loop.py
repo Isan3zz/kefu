@@ -24,9 +24,18 @@ from app.memory.trigger import CHANGE, STABLE, recommendation_request
 from app.multimodal.retrieval import TOOL_ARGS
 from app.multimodal.tool_adapter import tool_schemas
 from app.observability import active_trace, clean
-from app.refund_workflow import RefundWorkflowResult
+from app.refund_workflow import REJECTION_REASONS, RefundWorkflowResult
+from app.task_plan import task_checks
 
 PROMPT_VERSION = 'agent-loop-v9'
+TASK_PROMPT_VERSION = 'agent-loop-v9-task-plan-v2'
+ACTIVE_TASK_WARNING = '当前已有task，先完成现有的任务。'
+TASK_INSTRUCTION = (
+    '\n对于只包含物流和退款资格的复合查询，如果同一组检查适用于所有指定订单或最近二至四笔订单，'
+    '用 create_task_plan 登记所有检查，再查齐。查询最新订单时，先调用 get_orders，'
+    'limit 至少等于用户要求的笔数。根据 current_task.task_plan 中的待执行项继续，'
+    '只查未取得结果的项目。简单查询、退款申请、包含政策解释或其他目标的请求照常处理。'
+)
 SYSTEM = ('你是中文客服。自主选择工具，收到可信结果后答复；无须工具时直接答复。'
           '同一条消息有多个需求时查齐再答，可一批提议多个只读调用。不要重复已得到结果的工具。'
           '查完后直接用自然中文回答用户，先给当前订单或商品的结论，再逐项说明用户问到的内容。'
@@ -83,13 +92,16 @@ class LoopState(State, total=False):
     terminal_reason: str | None
     iteration_count: int
     tool_call_count: int
+    task_plan: dict | None
+    task_retry_pending: list[dict]
+    task_progress: dict | None
 
 
 class AgentLoop:
     def __init__(self, agent, ctx, services, text, skill_mode):
         self.agent, self.ctx, self.services, self.text, self.skill_mode = agent, ctx, services, text, skill_mode
         self.config, self.budget, self.telemetry = agent.config, services.budget, services.telemetry
-        self.catalog = tool_catalog(skill_mode)
+        self.catalog = tool_catalog(skill_mode, task_manager_enabled=self.config.task_manager_enabled)
         self.visual_tools = set()
         self.confirmation_nonce, self.memories = None, []
         self.refund_result: RefundWorkflowResult | None = None
@@ -105,13 +117,16 @@ class AgentLoop:
         builder.add_node('prepare_context', self.prepare)
         builder.add_node('agent_decide', self.decide)
         builder.add_node('execute_tools', self.execute)
+        builder.add_node('task_completion_gate', self.completion_gate)
         builder.add_node('validate_final', self.finish)
         builder.add_edge(START, 'prepare_context')
         builder.add_edge('prepare_context', 'agent_decide')
-        builder.add_conditional_edges('agent_decide', lambda state: 'final' if state.get('terminal_reason') else 'tools',
-                                      {'final':'validate_final', 'tools':'execute_tools'})
+        builder.add_conditional_edges('agent_decide', self.after_decision,
+                                      {'final':'validate_final', 'gate':'task_completion_gate', 'tools':'execute_tools'})
         builder.add_conditional_edges('execute_tools', self.after_tool,
-                                      {'final':'validate_final', 'again':'agent_decide', 'batch':'execute_tools'})
+                                      {'final':'validate_final', 'gate':'task_completion_gate', 'again':'agent_decide', 'batch':'execute_tools'})
+        builder.add_conditional_edges('task_completion_gate', lambda state: 'final' if state['terminal_reason'] else 'again',
+                                      {'final':'validate_final', 'again':'agent_decide'})
         builder.add_edge('validate_final', END)
         return builder
 
@@ -131,13 +146,51 @@ class AgentLoop:
                 'loop_invocation_id':self.ctx.invocation_id, 'loop_observations':[], 'loop_seen':[],
                 'loop_error':None, 'loop_memory_ids':[], 'batch_cursor':0, 'batch_size':0,
                 'intent':'other', 'selected_skill':None, 'iteration_count':0, 'tool_call_count':0,
-                'tool_events':[], 'retrieved_chunks':[], 'pending_confirmation':None, 'final_response':'', 'cards':None}
+                'tool_events':[], 'retrieved_chunks':[], 'pending_confirmation':None, 'final_response':'', 'cards':None,
+                'task_plan':None, 'task_retry_pending':[], 'task_progress':None}
+
+    @staticmethod
+    def after_decision(state):
+        if not state.get('terminal_reason'):
+            return 'tools'
+        return 'gate' if state.get('task_plan') else 'final'
 
     @staticmethod
     def after_tool(state):
         if state['batch_cursor'] < state['batch_size']:
             return 'batch'
-        return 'final' if state.get('terminal_reason') else 'again'
+        if not state.get('terminal_reason'):
+            return 'again'
+        return 'gate' if state.get('task_plan') else 'final'
+
+    @staticmethod
+    def task_progress(plan, checks):
+        return {'plan_id': plan['plan_id'], 'items': [check.progress() for check in checks]}
+
+    async def completion_gate(self, state):
+        plan = state['task_plan']
+        checks = task_checks(plan, state['loop_observations'])
+        progress = self.task_progress(plan, checks)
+        pending = [check.progress() for check in checks if check.status == 'PENDING']
+        reason = state['terminal_reason']
+        if reason in ('COMPLETED', 'NEEDS_INPUT', 'LIMIT'):
+            if all(check.status == 'COMPLETED' for check in checks):
+                if reason != 'LIMIT' or not state['loop_error']:
+                    reason = 'COMPLETED'
+            elif reason != 'LIMIT':
+                exhausted = (self.budget.steps >= self.config.agent_max_steps
+                             or self.budget.tool_calls >= self.config.agent_max_tool_calls)
+                if exhausted:
+                    reason = 'LIMIT'
+                elif pending and pending != state['task_retry_pending']:
+                    reason = None
+                else:
+                    reason = 'PARTIALLY_COMPLETED' if any(check.status == 'COMPLETED' for check in checks) else 'ERROR'
+        self.telemetry.emit('task.gate.checked', **progress, terminal_reason=reason, continued=reason is None)
+        if reason is None:
+            last = state['loop_messages'][-1]
+            return {'terminal_reason':None, 'task_retry_pending':pending, 'loop_messages':[RemoveMessage(id=last.id)]}
+        return {'terminal_reason':reason, 'task_progress':{**progress, 'status':reason}}
 
     def resolve(self, state):
         return resolve_order(self.text, state.get('active_order_id'), state.get('order_ids', []))
@@ -152,6 +205,12 @@ class AgentLoop:
         progress = {'iteration_count':self.budget.steps}
         task = {'message':self.text,'active_workflow_id':state.get('active_workflow_id'),
                 'resolved_order_id':self.resolve(state),'available_skills':meta if self.skill_mode != 'none' else []}
+        task_instruction = TASK_INSTRUCTION if self.config.task_manager_enabled else ''
+        catalog = self.catalog
+        if plan := state.get('task_plan'):
+            task['task_plan'] = self.task_progress(plan, task_checks(plan, state['loop_observations']))
+            task_instruction = '\n警告：' + ACTIVE_TASK_WARNING + '根据 current_task.task_plan 处理待执行项。'
+            catalog = [tool for tool in catalog if tool['function']['name'] != 'create_task_plan']
         visual_instruction = ''
         if self.visual_tools:
             if self.services.image_ids:
@@ -179,7 +238,7 @@ class AgentLoop:
         try:
             context = await self.services.context.build_context(
                 ctx=self.ctx, task_state=task, recent_messages=state['messages'],
-                system_prompt=SYSTEM + visual_instruction + reply_instruction, telemetry=self.telemetry,
+                system_prompt=SYSTEM + task_instruction + visual_instruction + reply_instruction, telemetry=self.telemetry,
                 memories=memories,
                 full_profile=self.config.memory_context_mode == 'profile',
                 memory_embedding_version=self.agent.memory.index.version if self.memories and self.config.memory_context_mode == 'semantic' else None,
@@ -191,13 +250,13 @@ class AgentLoop:
                 return self.fake_message({**state, **progress}, progress)
 
             decision = await self.services.model.complete_with_tools(
-                ctx=self.ctx, messages=context.messages, tool_schemas=self.catalog,
+                ctx=self.ctx, messages=context.messages, tool_schemas=catalog,
                 budget=self.budget, telemetry=self.telemetry, fake_message=fake_message,
                 **({'image_ids': self.services.image_ids, 'image_consent': True}
                    if self.services.allow_external_image_send else {}),
             )
         except DomainError as error:
-            if error.code == 'MODEL_BAD_OUTPUT' or (error.code == 'CONTEXT_BUDGET_EXCEEDED' and previous):
+            if error.code == 'MODEL_BAD_OUTPUT' or (error.code == 'CONTEXT_BUDGET_EXCEEDED' and (previous or state.get('task_plan'))):
                 return {**progress, 'loop_error':error.code,
                         'terminal_reason':'LIMIT' if error.code.endswith('EXCEEDED') else 'ERROR'}
             raise
@@ -308,6 +367,19 @@ class AgentLoop:
             self.emit('workflow_pending', workflow_id=result.workflow_id, graph_thread_id='wf:'+result.workflow_id)
         return asdict(result)
 
+    async def create_task_plan(self, args, progress):
+        order_ids = args.get('order_ids', [])
+        explicit = set(ORDER_IDS.findall(self.text))
+        if set(order_ids) != explicit:
+            self.telemetry.emit('task.plan.rejected', reason='UNMATCHED_ORDER_SCOPE')
+            raise DomainError('INVALID_ARGUMENT', '任务计划的订单范围与当前请求不符')
+        plan = {'plan_id':uid('plan-'), 'order_ids':order_ids, 'recent_order_count':args.get('recent_order_count'),
+                'checks':args['checks']}
+        progress['task_plan'] = plan
+        self.telemetry.emit('task.plan.created', plan_id=plan['plan_id'], order_ids=order_ids,
+                            recent_order_count=plan['recent_order_count'], checks=plan['checks'])
+        return {'plan_id':plan['plan_id']}
+
     async def execute(self, state):
         proposal = next(message for message in reversed(state['loop_messages']) if isinstance(message, AIMessage))
         calls = ordered_calls(proposal)
@@ -328,14 +400,20 @@ class AgentLoop:
         try:
             if self.budget.tool_calls >= self.config.agent_max_tool_calls:
                 raise HarnessFailure('STEP_LIMIT_EXCEEDED')
+            if name == 'create_task_plan' and state.get('task_plan'):
+                self.telemetry.emit('task.plan.rejected', reason='PLAN_ALREADY_EXISTS', tool_call_id=ident)
+                raise DomainError('PLAN_ALREADY_EXISTS', ACTIVE_TASK_WARNING)
             args = self.tool_arguments(name, args, state)
             signature = name + ':' + digest(json.dumps(args, ensure_ascii=False, sort_keys=True))
-            if signature in progress['loop_seen']:
+            if signature in progress['loop_seen'] and name != 'create_task_plan':
                 raise HarnessFailure('REPEATED_NO_PROGRESS')
             progress['loop_seen'].append(signature)
             skill = TOOL_SKILLS.get(name)
             execution = dict(ctx=self.ctx,tool_name=name,arguments=args,budget=self.budget,telemetry=self.telemetry,proposal_id=ident)
-            if name == 'load_skill':
+            if name == 'create_task_plan':
+                result = await self.services.tools.invoke_internal(
+                    **execution, handler=lambda values:self.create_task_plan(values,progress))
+            elif name == 'load_skill':
                 result = await self.services.tools.invoke_internal(**execution,handler=lambda values:self.load_skill(values,progress))
             else:
                 rewritten_query = await self.rewrite_knowledge(args,state,progress) if name == 'search_knowledge' else None
@@ -378,7 +456,8 @@ class AgentLoop:
                 stopped = 'HANDOFF'
         except (DomainError, ValidationError) as exc:
             error = exc.code if isinstance(exc, DomainError) else 'INVALID_ARGUMENT'
-            progress['loop_error'] = error
+            if error != 'PLAN_ALREADY_EXISTS':
+                progress['loop_error'] = error
             if self.budget.tool_calls == budget_before:
                 self.emit('tool_denied', tool_call_id=ident,name=name,rule_id=error,error_code=error)
             if error in ('REPEATED_NO_PROGRESS','STEP_LIMIT_EXCEEDED'):
@@ -389,8 +468,14 @@ class AgentLoop:
             elif name in RETRIEVAL_TOOLS and error in RETRIEVAL_UNAVAILABLE_ERRORS:
                 # A failed retrieval must not skip another tool in the batch.
                 pass
+            elif (result and not result.ok and error == 'NOT_FOUND' and state.get('task_plan')
+                  and any(check.tool == name and check.arguments == args
+                          for check in task_checks(state['task_plan'], state['loop_observations']))):
+                pass
             elif error in STOP_ERRORS or error in {'MULTIMODAL_MODEL_NOT_READY', 'MULTIMODAL_ENCODER_ERROR', 'INDEX_NOT_READY'} or name in ('begin_refund_workflow','create_ticket') and self.budget.tool_calls > budget_before:
                 stopped = 'ERROR'
+        if plan := progress.get('task_plan', state.get('task_plan')):
+            self.record_task_evidence(plan, state, progress)
         evidence_ids = [chunk['chunk_id'] for chunk in progress['retrieved_chunks']] if name=='search_knowledge' and not error else []
         observations.append(self.observation(call, error, data, evidence_ids, time.perf_counter()-started,
                                              operation_id=result.operation_id if result else None))
@@ -411,12 +496,18 @@ class AgentLoop:
             if 'image_id' in values and values['image_id'] not in self.services.image_ids:
                 self.services.tools.guard.deny(self.telemetry, 'ATTACHMENT_SCOPE', name)
             return values
-        if name not in VISIBLE_SCHEMAS or (name == 'load_skill' and self.skill_mode == 'none'):
+        if (name not in VISIBLE_SCHEMAS or (name == 'load_skill' and self.skill_mode == 'none')
+                or (name == 'create_task_plan' and not self.config.task_manager_enabled)):
             self.services.tools.guard.deny(self.telemetry,'AGENT_TOOL_NOT_ALLOWED',name)
         if not isinstance(args,dict):
             raise DomainError('INVALID_ARGUMENT','工具参数不是有效的 JSON 对象')
         args = VISIBLE_SCHEMAS[name].model_validate(args).model_dump()
         if name in ORDER_TOOLS:
+            plan = state.get('task_plan')
+            if plan and plan['recent_order_count'] and name in plan['checks']:
+                if any(check.tool == name and check.arguments == args
+                       for check in task_checks(plan, state['loop_observations'])):
+                    return args
             resolved = self.resolve(state)
             if args['order_id'] not in set(ORDER_IDS.findall(self.text)) | ({resolved} if resolved else set()):
                 raise DomainError('INVALID_ARGUMENT','请提供明确的订单号')
@@ -428,9 +519,18 @@ class AgentLoop:
             return {'category':args['reason'],'summary':summary[:2000],'conversation_id':self.ctx.conversation_id}
         return args
 
+    def record_task_evidence(self, plan, state, progress):
+        earlier = task_checks(plan, state['loop_observations']) if 'task_plan' not in progress else ()
+        known_ids = {check.observation['request_id'] for check in earlier if check.observation}
+        for check in task_checks(plan, progress['loop_observations']):
+            if check.observation and check.observation['request_id'] not in known_ids:
+                self.telemetry.emit('task.evidence.bound', plan_id=plan['plan_id'], **check.progress())
+
     def observation(self, call, error, data=None, evidence_ids=(), elapsed=0, *, operation_id=None):
         name, ident = call['name'], call['id']
         content = {'ok':False,'error_code':error} if error else {'ok':True,'data':clean(data)}
+        if error == 'PLAN_ALREADY_EXISTS':
+            content['message'] = ACTIVE_TASK_WARNING
         wire = json.dumps(content,ensure_ascii=False)
         if not error and len(wire.encode()) > max(self.config.context_tool_result_max_chars, 8500 if name=='load_skill' else 0):
             wire = self.compact_observation(name, data)
@@ -787,6 +887,8 @@ class AgentLoop:
             answer=f'订单 {oid}，退款金额 {cents//100}.{cents%100:02d} 元。请通过确认按钮确认退款申请。'
             if not self.confirmation_nonce:
                 answer='已有待确认申请，请使用原确认按钮；如凭据丢失，请取消后重新申请。'
+        elif state.get('task_plan') and reason != 'HANDOFF' and not self.refund_result:
+            answer = self.task_answer(state)
         elif self.uses_direct_product_reply(state):
             answer = self.product_answer(state, citations)
         elif reason == 'HANDOFF':
@@ -855,3 +957,26 @@ class AgentLoop:
         return dict(final_response=answer,terminal_reason=reason,
                     tool_events=[tool for tool in tools if tool['name'] in BUSINESS_TOOLS | TOOL_ARGS.keys()],
                     **({'cards': cards} if cards is not None else {}))
+
+    def task_answer(self, state):
+        plan = state['task_plan']
+        lines = []
+        labels = {'track_shipment':'物流', 'check_refund_eligibility':'退款资格'}
+        for check in task_checks(plan, state['loop_observations']):
+            if check.status == 'COMPLETED':
+                data = check.observation['data']
+                if check.tool == 'check_refund_eligibility' and not data['eligible']:
+                    order_id = check.arguments['order_id']
+                    reason = REJECTION_REASONS.get(data['reason_code'], '当前不满足自动退款条件')
+                    lines.append(f'订单 {order_id} 的退款资格：{reason}')
+                elif check.tool != 'get_orders':
+                    lines.append(self.display_business(check.tool, data, check.arguments, state['loop_memory_ids']))
+                elif len(data) < plan['recent_order_count']:
+                    lines.append(f'查到 {len(data)} 笔订单' if data else '未查询到您的订单')
+            elif check.tool == 'get_orders':
+                lines.append('未能核实您的最近订单')
+            else:
+                order_id = check.arguments['order_id']
+                lines.append(f'订单 {order_id} 的{labels[check.tool]}尚未核实')
+        self.emit('reply_composed', mode='TASK_EVIDENCE')
+        return '\n'.join(line.rstrip('。') + '。' for line in lines)

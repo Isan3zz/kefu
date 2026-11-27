@@ -3,6 +3,7 @@ from app.business import ProductSearch as Products
 from app.db import conversations
 from app.harness.contracts import HarnessFailure
 from app.multimodal.retrieval import TOOL_ARGS
+from app.task_plan import CreateTaskPlan
 
 class Arguments(BaseModel): model_config=ConfigDict(extra='forbid',strict=True)
 class ListOrders(Arguments): limit:int=Field(default=10,ge=1,le=20)
@@ -13,7 +14,7 @@ class KnowledgeQuery(Arguments):
     query:str=Field(min_length=1,max_length=1000)
     product_id:str|None=Field(default=None,min_length=1,max_length=100)
 
-INTERNAL_SCHEMAS={'load_skill':SkillName}
+INTERNAL_SCHEMAS={'load_skill':SkillName,'create_task_plan':CreateTaskPlan}
 SCHEMAS={'get_orders':ListOrders,'get_order':Order,'track_shipment':Order,'search_products':Products,'check_refund_eligibility':Order,'create_ticket':Ticket,'begin_refund_workflow':Order,
          'search_knowledge':KnowledgeQuery, **TOOL_ARGS}
 
@@ -33,6 +34,8 @@ class PolicyGuard:
         if budget.tool_calls>=self.config.agent_max_tool_calls: raise HarnessFailure('STEP_LIMIT_EXCEEDED')
         schemas=INTERNAL_SCHEMAS if internal else SCHEMAS
         if tool_name not in schemas: self.deny(telemetry,'TOOL_NOT_ALLOWED',tool_name)
+        if tool_name=='create_task_plan' and not self.config.task_manager_enabled:
+            self.deny(telemetry,'TASK_MANAGER_DISABLED',tool_name)
         if not internal and tool_name not in self.skills.allowed_tools(skill_name): self.deny(telemetry,'SKILL_TOOL_NOT_ALLOWED',tool_name)
         try: validated=schemas[tool_name].model_validate(arguments).model_dump(exclude_unset=True)
         except ValueError:

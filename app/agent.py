@@ -104,10 +104,10 @@ class Agent:
     async def chat(self,a,conv,text,mode='real',skill_mode='selected',request_id=None):
         return await self.harness.invoke_chat(principal=a,conversation_id=conv,message=text,mode=mode,skill_mode=skill_mode,client_request_id=request_id,legacy=True)
     async def _chat(self,a,conv,text,mode,skill_mode,ctx,services):
-        from app.agent_loop import AgentLoop, PROMPT_VERSION
+        from app.agent_loop import AgentLoop, PROMPT_VERSION, TASK_PROMPT_VERSION
         from app.harness.tool_protocol import MAX_TOOL_BATCH
         recorder=active_trace.get()
-        recorder.payload['prompt_version']=PROMPT_VERSION
+        recorder.payload['prompt_version']=TASK_PROMPT_VERSION if self.config.task_manager_enabled else PROMPT_VERSION
         trace_id=recorder.trace_id
         try:
             consent_generation=self.memory.consent_snapshot(ctx.principal)
@@ -162,6 +162,8 @@ class Agent:
         response = dict(conversation_id=conv,message_id=mid,answer=result['final_response'],intent=result['intent'],skill={'name':result.get('selected_skill'),'version':recorder.payload.get('skill_version')},citations=result['retrieved_chunks'],tool_actions=result['tool_events'],pending_confirmation=pending,trace_id=trace_id,terminal_reason=result['terminal_reason'],iteration_count=budget.steps,tool_call_count=budget.tool_calls,model_usage=usage,error_code=next((e.get('error_code') for e in recorder.payload['events'] if e['type']=='error'),None), **({'cards':result['cards']} if result.get('cards') is not None else {}))
         if loop.refund_result:
             response['refund_workflow_result'] = asdict(loop.refund_result)
+        if task_progress := result.get('task_progress'):
+            response['task_progress'] = task_progress
         return response
     async def confirm(self,a,wid,nonce,request_id=None):
         result = await self.harness.resume_workflow(

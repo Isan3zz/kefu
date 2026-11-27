@@ -24,7 +24,8 @@ def compatibility(baseline, candidate):
                 'knowledge': snapshot.get('snapshot') or snapshot.get('snapshot_id') or report.get('knowledge_corpus_sha256'),
                 'retrieval': (report.get('retrieval_mode'), report.get('retrieval_config')),
                 'skill_mode': report.get('skill_mode'), 'harness_config': report.get('harness_config'),
-                'fault_injection': report.get('inject_unsafe_action')}
+                'fault_injection': report.get('inject_unsafe_action'),
+                'task_manager_enabled': report.get('task_manager_enabled', False)}
     old, new = sources(baseline), sources(candidate)
     return {key: {'baseline': old[key], 'candidate': new[key]} for key in old if old[key] != new[key]}
 

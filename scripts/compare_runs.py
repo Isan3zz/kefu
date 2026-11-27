@@ -12,7 +12,7 @@ def main():
     parser.add_argument('--baseline', required=True)
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--gate-policy', type=Path)
-    parser.add_argument('--vary', action='append', default=[], choices=['agent_model_config', 'judge_config', 'models', 'retrieval', 'skill_mode', 'harness_config', 'fault_injection', 'knowledge'])
+    parser.add_argument('--vary', action='append', default=[], choices=['agent_model_config', 'judge_config', 'models', 'retrieval', 'skill_mode', 'harness_config', 'fault_injection', 'knowledge', 'task_manager_enabled'])
     parser.add_argument('--output', type=Path)
     parser.add_argument('--enforce', action='store_true', help='Exit nonzero for FAIL or BLOCKED')
     args = parser.parse_args()

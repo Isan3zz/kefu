@@ -59,6 +59,158 @@ async def test_L01_greeting_final_without_tools(loop_chat):
     assert isinstance(messages[-1],AIMessage) and not messages[-1].tool_calls
 
 
+def order_check_plan(*, order_ids=None, recent_order_count=None):
+    scope = {'order_ids': order_ids} if order_ids is not None else {'recent_order_count': recent_order_count}
+    return call('create_task_plan', {**scope, 'checks': ['track_shipment', 'check_refund_eligibility']})
+
+
+def query_order_checks(order_id):
+    return [call(tool, {'order_id': order_id}, f'{tool}_{order_id}')
+            for tool in ('track_shipment', 'check_refund_eligibility')]
+
+
+async def test_task_plan_reopens_early_answer_and_reports_every_verified_result(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+
+    def finish_missing(body):
+        current = json.loads(body['messages'][1]['content'])['current_task']
+        assert '当前已有task，先完成现有的任务。' in body['messages'][0]['content']
+        assert 'create_task_plan' not in {tool['function']['name'] for tool in body['tools']}
+        assert all(m.get('content') != '客户要求的查询全部完成。' for m in body['messages'])
+        assert [item['order_id'] for item in current['task_plan']['items'] if item['status'] == 'PENDING'] == ['O1002', 'O1002']
+        return query_order_checks('O1002')
+
+    result, requests, trace, _ = await loop_chat('查 O1001 和 O1002 各自的物流和退款资格。', [
+        query_order_checks('O1001'),
+        [order_check_plan(order_ids=['O1001', 'O1002'])],
+        '客户要求的查询全部完成。',
+        finish_missing,
+        '订单 O1001 已签收。',
+    ])
+    assert len(requests) == 5 and result['terminal_reason'] == 'COMPLETED'
+    assert 'create_task_plan' in {tool['function']['name'] for tool in requests[0]['tools']}
+    assert '当前已有task' not in requests[0]['messages'][0]['content']
+    assert [item['status'] for item in result['task_progress']['items']] == ['COMPLETED'] * 4
+    assert len({item['evidence_id'] for item in result['task_progress']['items']}) == 4
+    assert result['answer'].count('O1001') == 2 and result['answer'].count('O1002') == 2
+    assert '已签收' in result['answer'] and '运输中' in result['answer'] and '需要人工审核' in result['answer']
+    assert result['tool_call_count'] == 5 and len(result['tool_actions']) == 4
+    assert [e['continued'] for e in trace['events'] if e['type'] == 'task.gate.checked'] == [True, False]
+
+
+async def test_task_plan_returns_verified_partial_results_at_budget_limit(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    env['cfg'].agent_max_tool_calls = 3
+    result, requests, _, _ = await loop_chat('查 O1001 和 O1002 各自的物流和退款资格。', [
+        [order_check_plan(order_ids=['O1001', 'O1002']), *query_order_checks('O1001')],
+    ])
+    assert len(requests) == 1 and result['terminal_reason'] == 'LIMIT'
+    assert 'O1001' in result['answer'] and '已签收' in result['answer']
+    assert 'O1002 的物流尚未核实' in result['answer'] and 'O1002 的退款资格尚未核实' in result['answer']
+    assert [item['status'] for item in result['task_progress']['items']] == ['COMPLETED', 'COMPLETED', 'PENDING', 'PENDING']
+
+
+async def test_task_plan_stops_after_a_correction_with_no_progress(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    result, requests, trace, _ = await loop_chat('查 O1001 和 O1002 各自的物流和退款资格。', [
+        [order_check_plan(order_ids=['O1001', 'O1002']), *query_order_checks('O1001')],
+        '已经查完所有订单。',
+        '全部结束。',
+    ])
+    assert len(requests) == 3 and result['terminal_reason'] == 'PARTIALLY_COMPLETED'
+    assert '尚未核实' in result['answer'] and '全部结束' not in result['answer']
+    assert [e['continued'] for e in trace['events'] if e['type'] == 'task.gate.checked'] == [True, False]
+
+
+async def test_task_plan_recent_targets_come_only_from_sufficient_order_list(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    cfg = env['cfg']
+    cfg.context_compact_threshold = .01
+
+    def read_recent(body):
+        task = json.loads(body['messages'][1]['content'])['current_task']['task_plan']
+        assert task['items'][0]['status'] == 'COMPLETED'
+        ids = list(dict.fromkeys(row['order_id'] for row in task['items'][1:]))
+        assert len(ids) == 2 and set(ids) <= {'O1001', 'O1002', 'O1003', 'O1004'}
+        return [*query_order_checks(ids[0]), *query_order_checks(ids[1])]
+
+    result, _, trace, _ = await loop_chat('查我最近两笔订单各自的物流和退款资格。', [
+        [call('get_orders', {'limit': 1}, 'list_short')],
+        [order_check_plan(recent_order_count=2), call('get_orders', {'limit': 2}, 'list_two')],
+        read_recent,
+        '查询完成。',
+    ])
+    assert result['terminal_reason'] == 'COMPLETED'
+    assert len(result['task_progress']['items']) == 5
+    assert any(e['type'] == 'context.compacted' for e in trace['events'])
+
+
+async def test_task_plan_recent_target_can_resolve_to_fewer_owned_orders(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    env['a'] = env['other']
+    env['conv'] = env['b'].conversation(env['a'])['id']
+    result, _, trace, _ = await loop_chat('查一下我最近两笔订单的物流和退款资格。', [
+        [order_check_plan(recent_order_count=2), call('get_orders', {'limit': 2})],
+        [call('track_shipment', {'order_id': 'O1001'}), *query_order_checks('O2001')],
+        '查询完成。',
+    ])
+    assert result['terminal_reason'] == 'COMPLETED'
+    assert len(result['task_progress']['items']) == 3
+    assert '查到 1 笔订单' in result['answer'] and 'O1001' not in result['answer']
+    assert any(e['type'] == 'loop.tool_denied' and e['tool_call_id'] == 'call_track_shipment' for e in trace['events'])
+
+
+async def test_task_plan_keeps_working_when_one_named_order_is_inaccessible(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    result, _, _, _ = await loop_chat('查 O2001 和 O1001 各自的物流和退款资格。', [
+        [order_check_plan(order_ids=['O2001', 'O1001']), *query_order_checks('O2001'), *query_order_checks('O1001')],
+        '查完了。',
+    ])
+    assert result['terminal_reason'] == 'PARTIALLY_COMPLETED'
+    assert [item['status'] for item in result['task_progress']['items']] == ['FAILED', 'FAILED', 'COMPLETED', 'COMPLETED']
+    assert 'O2001 的物流尚未核实' in result['answer'] and 'O1001 的物流状态' in result['answer']
+
+
+async def test_task_plan_rejects_forged_scope_and_duplicate_creation(env, loop_chat):
+    env['cfg'].task_manager_enabled = True
+    plan = order_check_plan(order_ids=['O1001', 'O1002'])
+    forged = order_check_plan(order_ids=['O1001', 'O2001'])
+    forged['id'] = 'call_forged_plan'
+    duplicate = {**plan, 'id': 'call_duplicate_plan'}
+    hidden = {**plan, 'id': 'call_hidden_plan'}
+    result, _, trace, transcript = await loop_chat('查 O1001 和 O1002 各自的物流和退款资格。', [
+        [forged, plan, duplicate, *query_order_checks('O1001')],
+        [hidden, *query_order_checks('O1002')],
+        '已查到结果。',
+    ])
+    assert result['terminal_reason'] == 'COMPLETED'
+    assert result['tool_call_count'] == 6
+    assert [e['reason'] for e in trace['events'] if e['type'] == 'task.plan.rejected'] == [
+        'UNMATCHED_ORDER_SCOPE', 'PLAN_ALREADY_EXISTS', 'PLAN_ALREADY_EXISTS',
+    ]
+    assert sum(e['type'] == 'task.plan.created' for e in trace['events']) == 1
+    rejected = [m for m in transcript if isinstance(m, ToolMessage) and m.status == 'error']
+    assert [m.tool_call_id for m in rejected] == ['call_forged_plan', 'call_duplicate_plan', 'call_hidden_plan']
+    for message in rejected[1:]:
+        assert json.loads(message.content) == {
+            'ok': False, 'error_code': 'PLAN_ALREADY_EXISTS', 'message': '当前已有task，先完成现有的任务。',
+        }
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+async def test_task_manager_optional_and_does_not_carry_over_plan(env, loop_chat, enabled):
+    env['cfg'].task_manager_enabled = enabled
+    if enabled:
+        await loop_chat('查 O1001 的物流和退款资格。', [
+            [order_check_plan(order_ids=['O1001']), *query_order_checks('O1001')],
+            '查询完成。',
+        ])
+    result, requests, trace, _ = await loop_chat('你好', ['你好，有什么可以帮助你？'])
+    assert ('create_task_plan' in {tool['function']['name'] for tool in requests[0]['tools']}) is enabled
+    assert len(requests) == 1 and 'task_progress' not in result
+    assert not any(e['type'].startswith('task.') for e in trace['events'])
+
+
 async def test_L02_L04_native_decision_observation_and_final(loop_chat):
     def observe(body):
         assistant, tool = body['messages'][-2:]

@@ -1,5 +1,66 @@
 # 实施报告
 
+## Task Manager 首版（2026-11-27）
+
+任务计划覆盖复合物流和退款资格查询。设置 `TASK_MANAGER_ENABLED=true` 后，Agent 可选择调用内部工具 `create_task_plan`，接受最多四笔明确指定的订单，或请求最近二至四笔订单。计划必须包含至少两项检查，表单拒绝重复订单、检查项及模型传入的身份或证据字段。同一 Invocation 只允许创建一个计划。
+
+当前 Invocation 创建计划后，后续模型请求隐藏 `create_task_plan`，在系统提示中加入「当前已有task，先完成现有的任务。」。同批次重复提议或模型仍提议已隐藏的工具时，执行前返回 `PLAN_ALREADY_EXISTS` 及相同提示，保留原计划和后续工具调用，也不消耗工具调用配额。开启组的提示版本更新为 `agent-loop-v9-task-plan-v2`。
+
+原路径从模型决策或工具执行进入 `validate_final`。当前有计划时先进入 Completion Gate。每项检查按工具、订单和同一 Invocation 中的已校验结果匹配，已有结果可以在创建计划时回填。最近订单的下游检查依赖一次查询上限足够的 `get_orders`。服务端按真实返回的订单展开检查。不同订单、未执行的工具及模型的文字陈述都不能满足证据要求。查询结果为不符合退款条件时，资格查询仍算完成。
+
+计划和工具结果随普通聊天的 LangGraph Checkpoint 保存，新的 Invocation 会重置计划。模型上下文只增加有界的任务条目和证据引用。Gate 在仍有预算和待执行项时允许补查，同一批未完成项只得到一次补查机会。正常答复和预算耗尽时的部分答复均由已核实结果逐项组装。聊天响应和 Trace 可查看计划状态与证据引用。
+
+改动涉及 `app/task_plan.py`、`app/agent_loop.py`、`app/loop_tools.py`、`app/harness/policy_guard.py`、`app/agent.py`、`app/config.py` 和 `.env.example`。评测与追踪涉及 `app/harness/loop_metrics.py`、`app/evaluation.py`、`app/eval_gate.py`、`scripts/compare_runs.py`、`tests/test_openai_adapter.py` 和 `datasets/validation/task_plan_order_checks.jsonl`。
+
+首版默认关闭，确定性保障覆盖已登记的受支持查询。计划由模型选择，用户目标遗漏依旧需要独立评测。退款申请在面向用户的确认接口和独立 Workflow 中执行，计划与退款 Workflow 之间的持久化关联、跨 Invocation 续跑和通用计划修改属于后续阶段。
+
+### 测试
+
+重复创建拦截改动后，`uv run --no-sync pytest -q --tb=short tests/test_openai_adapter.py tests/unit/harness/test_foundation.py` 通过 47 项，覆盖同批次重复、已隐藏工具的再次提议、警告注入和原计划继续执行。以 `TASK_MANAGER_ENABLED=true` 执行 `uv run --no-sync pytest -q --tb=short tests/test_acceptance.py -k test_T`，T01–T20 共 21 项通过。相同开关下执行 `uv run --no-sync python -m scripts.run_eval --dataset datasets/validation/task_plan_order_checks.jsonl --mode agent-real --agent-release task-plan-active-guard`，真实模型通过 6/6，目标用例创建计划 4/4，越权和重复退款均为 0。 [防重复改动评测](data/eval_runs/run-9f568de8a7b6ea5d1f62a4bf/report.json)
+
+开启 Task Manager 的验收通过 92 项，涵盖 T01–T20、9 个新增参数化场景、FastMCP 调用、LangGraph 退款中断与跨进程恢复、Chroma 1024 维嵌入及本地 SentenceTransformers 加载。已安装的模型修订为 BGE-M3 `5617a9f61b028005a4858fdac845db406aefb181` 和 BGE Reranker `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`。 [验收记录](data/task-manager-enabled-acceptance.xml)
+
+```powershell
+$env:OMP_NUM_THREADS='8'
+$env:MKL_NUM_THREADS='8'
+$env:TASK_MANAGER_ENABLED='true'
+uv run --no-sync pytest -q -ra -m 'not real' --tb=short tests/test_openai_adapter.py tests/test_acceptance.py tests/test_integration.py tests/test_refund_result_guard.py tests/test_local_sdk_smoke.py --junitxml data/task-manager-enabled-acceptance.xml
+uv run --no-sync pytest -q --tb=short tests/test_eval_v3.py tests/test_dataset_contract.py tests/test_eval_persistence.py
+uv lock --check
+```
+
+评测、数据契约与评测持久化复跑 29 项通过。`uv lock --check` 通过。
+
+全量回归执行 `uv run --no-sync pytest -q -ra -m 'not real' --tb=short --junitxml data/task-manager-regression.xml`，结果为 303 通过、2 跳过、5 排除。全量收集后新增的少订单回归由上面的 92 项验收覆盖。跳过项为未启用的两项 Chinese-CLIP 相关本地测试，排除项为 `real` 标记的外部模型测试。真实主模型另使用下述隔离评测验证。 [全量测试记录](data/task-manager-regression.xml)
+
+### 真实模型对照
+
+固定代码摘要、`deepseek-flash`、知识快照 `kb-61521e8959623c3ff07ff84e`、隔离业务 fixture 和同一组 6 条验证样本。开关同步改变 Agent 的提示词、工具 Schema 和运行路径。独立标签按工具和订单号定义所需查询，答复另有文本断言。用例包含 4 条目标查询和 2 条对照请求。
+
+```powershell
+$env:OMP_NUM_THREADS='8'
+$env:MKL_NUM_THREADS='8'
+$env:TASK_MANAGER_ENABLED='false'
+uv run --no-sync python -m scripts.run_eval --dataset datasets/validation/task_plan_order_checks.jsonl --mode agent-real --agent-release task-plan-off-final
+$env:TASK_MANAGER_ENABLED='true'
+uv run --no-sync python -m scripts.run_eval --dataset datasets/validation/task_plan_order_checks.jsonl --mode agent-real --agent-release task-plan-on-final
+uv run --no-sync python -m scripts.compare_runs --baseline run-8760d289a208f235fbe67ed1 --candidate run-860e8bd2e1987c65c8ee2568 --vary task_manager_enabled --output data/task-plan-final-comparison.json
+```
+
+| 指标 | 关闭 | 开启 |
+|---|---:|---:|
+| 端到端通过 | 5/6 | 6/6 |
+| 必需动作断言通过 | 12/16 | 16/16 |
+| 回答文本断言通过 | 5/6 | 6/6 |
+| 目标用例创建计划 | 0/4 | 4/4 |
+| 对照用例创建计划 | 0/2 | 0/2 |
+| 主模型调用 | 16 | 18 |
+| 主模型输入 / 输出 tokens | 38,667 / 2,652 | 52,142 / 2,559 |
+| 平均计划工具 / 其他工具调用 | 0.00 / 2.67 | 0.83 / 2.83 |
+| Agent p95 | 7.19 s | 6.20 s |
+
+比较门禁为 PASS。唯一个案变化是最近两笔订单的物流和退款资格查询。关闭时工具参数校验未放行从订单列表取得的两个新订单号。开启时有一次计划的订单范围校验拒绝，随后使用最近订单选择器，完成四项查询。两组越权、未授权副作用和重复退款均为 0。真实样本中没有发生早停后的补查，Gate 补查、无进展终止和预算耗尽由脚本化模型回归验证。6 个样本用于验证机制和观察开销，样本量不足以推断总体收益或延迟变化。 [关闭报告](data/eval_runs/run-8760d289a208f235fbe67ed1/report.json) · [开启报告](data/eval_runs/run-860e8bd2e1987c65c8ee2568/report.json) · [对比](data/task-plan-final-comparison.json)
+
 ## 普通回复切换为模型直接回答（2026-11-26）
 
 `agent-loop-v9` 允许模型根据工具结果和知识证据直接生成面向客户的普通回复。删除 `{{B1}}` / `{{K1}}` 模板校验与拼接知识原文的备用回复。引用无效、输出空白或出现未经核验的退款成功声明时给出错误状态。退款确认与退款回执仍取后端权威结果，创建工单后直接展示已核实的编号。离线 Fake Agent 只输出核实的业务字段及模拟知识来源提示。

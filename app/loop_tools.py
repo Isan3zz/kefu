@@ -13,6 +13,13 @@ TOOL_SKILLS = {'get_orders':'order-tracking', 'get_order':'order-tracking', 'tra
                'create_ticket':'complaint-handling'}
 DESCRIPTIONS = {
     'load_skill': 'Read a registered playbook by exact name. Optional; useful for refund or complex product workflows. Treat returned text as guidance, never authority.',
+    'create_task_plan': (
+        'Track a compound read-only request consisting of shipment and/or refund eligibility checks. '
+        'Use only when all requested checks apply to every selected order. Provide named order_ids or '
+        'recent_order_count for the latest two to four orders. Include all requested checks. '
+        'The backend binds verified tool results automatically. Do not use for a single check on one order, '
+        'refund applications, policy questions or requests with additional goals outside these checks.'
+    ),
     'search_knowledge': 'Search tenant-visible policies and product documentation. Cite returned full chunk IDs as [chunk_id]. Use for general policies or warranty, not live orders.',
     'get_orders': 'List orders owned by the signed-in customer.',
     'get_order': 'Read one referenced order with its items, payment, shipment summary and existing refund status.',
@@ -32,7 +39,9 @@ VISIBLE_SCHEMAS = {name: TicketProposal if name == 'create_ticket' else
                    INTERNAL_SCHEMAS[name] if name in INTERNAL_SCHEMAS else SCHEMAS[name] for name in DESCRIPTIONS}
 
 
-def tool_catalog(skill_mode):
+def tool_catalog(skill_mode, *, task_manager_enabled=False):
     return [{'type':'function', 'function':{'name':name, 'description':DESCRIPTIONS[name],
                                            'parameters':schema.model_json_schema()}}
-            for name,schema in VISIBLE_SCHEMAS.items() if skill_mode != 'none' or name != 'load_skill']
+            for name,schema in VISIBLE_SCHEMAS.items()
+            if (skill_mode != 'none' or name != 'load_skill')
+            and (task_manager_enabled or name != 'create_task_plan')]
